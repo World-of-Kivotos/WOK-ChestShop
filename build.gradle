@@ -109,6 +109,11 @@ tasks.named('jar', Jar).configure {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = 17
-    // 明示过时 API 的具体位置: 默认 javac 只说"用到了过时 API"却不说是哪一处, 等于没说。
+}
+
+// 只给本工程源码开 deprecation 明细: 默认 javac 只说"用到了过时 API"却不说是哪一处, 等于没说。
+// 不能挂在 withType(JavaCompile) 上 —— 那会连 ForgeGradle 解压出来的 MC 源码一起编, 刷出上百条
+// 与我们无关的警告, 把自己那一条淹掉。
+tasks.named('compileJava', JavaCompile).configure {
     options.compilerArgs << '-Xlint:deprecation'
 }

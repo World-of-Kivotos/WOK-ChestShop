@@ -6,13 +6,24 @@ import com.miningdim.economy.EconomyServices;
 import com.miningdim.economy.IEconomyService;
 import com.miningdim.testutil.MockGameTestPlayers;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.entity.SignBlockEntity;
+import net.minecraft.world.level.block.entity.SignText;
+import net.minecraft.world.phys.BlockHitResult;
+import net.minecraft.world.phys.Vec3;
+import net.minecraftforge.event.entity.player.PlayerInteractEvent;
+import net.minecraftforge.event.level.BlockEvent;
 import net.minecraftforge.gametest.GameTestHolder;
 import net.minecraftforge.gametest.PrefixGameTestTemplate;
 
@@ -573,8 +584,240 @@ public final class ShopGameTests {
     }
 
     // ============================================================
+    // 交互层端到端: 真放牌、真触发事件、真验证登记与上蜡
+    // ============================================================
+
+    /**
+     * 激活闸门: 非 OP 右键不能激活, OP 右键激活并上蜡。
+     * 这是整套权限模型唯一的入口, 之前只有纯逻辑用例覆盖登记表本身, handler 从未被实例化过。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerActivationRequiresOpAndWaxes(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "16", "B 250:200 S", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+        SignBlockEntity sign = (SignBlockEntity) level.getBlockEntity(pos);
+
+        try {
+            deop(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(!registry.isActivated(pos), "a non-op right click must NOT activate the shop");
+            helper.assertTrue(!sign.isWaxed(), "and must NOT wax the sign");
+
+            op(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "an op right click activates the shop");
+            helper.assertTrue(sign.isWaxed(), "activation waxes the sign so its text is frozen");
+            AdminShopRegistry.ShopRecord rec = registry.recordAt(pos);
+            helper.assertTrue(rec.quantity() == 16 && rec.buyPrice() == 250L && rec.sellPrice() == 200L,
+                    "the snapshot captured what was on the sign at activation time");
+        } finally {
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    /** 激活后被撬蜡改价: 下次交易必须检出内容不符, 拒绝成交并就地注销。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerRejectsTamperedSign(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "16", "B 250:200 S", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+        SignBlockEntity sign = (SignBlockEntity) level.getBlockEntity(pos);
+
+        try {
+            op(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "shop is live before tampering");
+
+            // 撬蜡改价 (把 250 改成 free)。
+            writeSign(sign, "Admin Shop", "16", "B free", "diamond");
+            deop(level, player);
+            handler.onRightClick(rightClick(player, pos));
+
+            helper.assertTrue(countInInventory(player, Items.DIAMOND) == 0,
+                    "a tampered sign must not hand out goods");
+            helper.assertTrue(!registry.isActivated(pos),
+                    "and the shop is deactivated on detection rather than left half-trusted");
+        } finally {
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    /**
+     * 幽灵登记的完整回归: 告示牌经【不触发 BreakEvent 的途径】消失 (这里用 setBlock 模拟爆炸/活塞/
+     * 支撑方块脱落), 登记项残留下来; 攻击者在同坐标立一块自己写的免费店牌, 必须拿不到任何东西。
+     *
+     * 这条用例在修复前是红的 —— 那时交易准入只查坐标, 攻击者的牌会被当成被授权的商店。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerDeniesShopRebuiltOnGhostRegistration(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "16", "B 250:200 S", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+
+        try {
+            op(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "shop is live");
+
+            // 非玩家途径移除告示牌: 不经 BlockEvent.BreakEvent, 所以登记不会被注销。
+            level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+            helper.assertTrue(registry.isActivated(pos),
+                    "the registration does survive a non-player removal - that is exactly the ghost we defend against");
+
+            // 攻击者在残留坐标立一块自己写的免费店。
+            level.setBlock(pos, Blocks.OAK_SIGN.defaultBlockState(), 3);
+            SignBlockEntity attackerSign = (SignBlockEntity) level.getBlockEntity(pos);
+            writeSign(attackerSign, "Admin Shop", "64", "B free", "diamond");
+
+            deop(level, player);
+            handler.onRightClick(rightClick(player, pos));
+
+            helper.assertTrue(countInInventory(player, Items.DIAMOND) == 0,
+                    "a ghost registration must NOT let a player claim a free shop");
+            helper.assertTrue(!registry.isActivated(pos), "and the stale registration is swept");
+        } finally {
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    /** 已激活的商店牌对普通玩家不可破坏 (潜行左键与 BreakEvent 两条路都要拦住)。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerProtectsActiveShopFromNonOpBreak(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "16", "B 250:200 S", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+
+        try {
+            op(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "shop is live");
+
+            deop(level, player);
+            player.setShiftKeyDown(true);
+            PlayerInteractEvent.LeftClickBlock sneakLeft = leftClick(player, pos);
+            handler.onLeftClick(sneakLeft);
+            helper.assertTrue(sneakLeft.isCanceled(),
+                    "a non-op sneak-left-click on an active shop is canceled (no one-second teardown)");
+            helper.assertTrue(registry.isActivated(pos), "and the shop stays registered");
+
+            BlockEvent.BreakEvent breakEvent = new BlockEvent.BreakEvent(
+                    level, pos, level.getBlockState(pos), player);
+            handler.onBlockBreak(breakEvent);
+            helper.assertTrue(breakEvent.isCanceled(), "a non-op break of an active shop is canceled");
+            helper.assertTrue(registry.isActivated(pos), "and the registration is not dropped");
+
+            // OP 破坏才真正注销。
+            op(level, player);
+            BlockEvent.BreakEvent opBreak = new BlockEvent.BreakEvent(
+                    level, pos, level.getBlockState(pos), player);
+            handler.onBlockBreak(opBreak);
+            helper.assertTrue(!opBreak.isCanceled(), "an op break goes through");
+            helper.assertTrue(!registry.isActivated(pos), "and deactivates the shop");
+        } finally {
+            player.setShiftKeyDown(false);
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    /** 成交防抖: 同一玩家对同一块牌连点, 冷却内的重复触发不得再次扣款。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerDebouncesRapidRepeatTrades(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "1", "B 100", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+
+        try {
+            op(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "shop is live");
+
+            eco.grant(player, Currency.CREDIT, 1000L);
+            long start = eco.creditBalance(player);
+
+            // 客户端按 tick 重发交互包时, handler 会在同一 gameTime 被连续调用多次。
+            for (int i = 0; i < 5; i++) {
+                handler.onRightClick(rightClick(player, pos));
+            }
+
+            long spent = start - eco.creditBalance(player);
+            helper.assertTrue(spent == 100L,
+                    "five rapid right clicks must charge exactly one purchase, not five (actual spent=" + spent + ")");
+            helper.assertTrue(countInInventory(player, Items.DIAMOND) == 1,
+                    "and deliver exactly one unit");
+        } finally {
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    // ============================================================
     // helper
     // ============================================================
+
+    /** 在测试结构内立一块写好四行的告示牌, 并把玩家挪到它旁边 (交互距离校验要求 6 格内)。 */
+    private static BlockPos placeShopSign(GameTestHelper helper, ServerPlayer player, String... lines) {
+        ServerLevel level = helper.getLevel();
+        BlockPos pos = helper.absolutePos(new BlockPos(0, 1, 0));
+        level.setBlock(pos, Blocks.OAK_SIGN.defaultBlockState(), 3);
+        SignBlockEntity sign = (SignBlockEntity) level.getBlockEntity(pos);
+        writeSign(sign, lines);
+        player.moveTo(pos.getX() + 0.5D, pos.getY(), pos.getZ() + 1.5D);
+        return pos;
+    }
+
+    private static void writeSign(SignBlockEntity sign, String... lines) {
+        SignText text = sign.getFrontText();
+        for (int i = 0; i < lines.length; i++) {
+            text = text.setMessage(i, Component.literal(lines[i]));
+        }
+        sign.setText(text, true);
+    }
+
+    private static PlayerInteractEvent.RightClickBlock rightClick(ServerPlayer player, BlockPos pos) {
+        BlockHitResult hit = new BlockHitResult(Vec3.atCenterOf(pos), Direction.UP, pos, false);
+        return new PlayerInteractEvent.RightClickBlock(player, InteractionHand.MAIN_HAND, pos, hit);
+    }
+
+    private static PlayerInteractEvent.LeftClickBlock leftClick(ServerPlayer player, BlockPos pos) {
+        return new PlayerInteractEvent.LeftClickBlock(player, pos, Direction.UP,
+                PlayerInteractEvent.LeftClickBlock.Action.START);
+    }
+
+    private static void op(ServerLevel level, ServerPlayer player) {
+        level.getServer().getPlayerList().op(player.getGameProfile());
+    }
+
+    private static void deop(ServerLevel level, ServerPlayer player) {
+        level.getServer().getPlayerList().deop(player.getGameProfile());
+    }
+
+    /** op 列表与登记表都是服务端全局状态, 测试必须自己收拾干净, 否则会污染同批次的其它用例。 */
+    private static void cleanup(ServerLevel level, ServerPlayer player, AdminShopRegistry registry, BlockPos pos) {
+        deop(level, player);
+        registry.deactivate(pos);
+        level.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+    }
 
     /** 经济门面必须由主 mod 在服务端启动期注入; 未注入说明跨 mod 接线断了, 直接判失败而非跳过。 */
     private static IEconomyService requireEconomy(GameTestHelper helper) {
