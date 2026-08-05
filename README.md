@@ -94,7 +94,7 @@ $env:JAVA_HOME = "C:\Users\<你>\.gradle\jdks\eclipse_adoptium-17-amd64-windows\
 
 ### 测试
 
-`gradlew runGameTestServer` 应输出 `All 19 required tests passed`。
+`gradlew runGameTestServer` 应输出 `All 24 required tests passed`。
 
 判定成功必须看这一行，不能只看 Gradle 退出码 —— 服务端启动阶段崩溃时 `runGameTestServer` 仍可能报 BUILD SUCCESSFUL。另外若看到 `0 tests are now running` 也是失败信号：那通常意味着 GameTest 的 structure 用了别的 mod 的命名空间，被 Forge 按 namespace 静默过滤掉了。
 
