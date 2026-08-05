@@ -46,7 +46,7 @@ public record ShopPriceLine(Long buyPrice, Long sellPrice) {
         if (raw == null) {
             return null;
         }
-        String line = raw.trim();
+        String line = raw.strip();
         if (line.isEmpty()) {
             return null;
         }
@@ -81,23 +81,35 @@ public record ShopPriceLine(Long buyPrice, Long sellPrice) {
     private record Part(char marker, long price) {
 
         static Part parse(String raw) {
-            String s = raw.trim().toUpperCase(Locale.ROOT);
+            // strip() 而非 trim(): trim 只剥 <= U+0020 的字符, 剥不掉中文输入法的全角空格 U+3000,
+            // 而 strip 用的正是下面循环里同一套 Character.isWhitespace 判据。全程只留这一套口径 ——
+            // 早先版本混用 isWhitespace 放行、正则 \\s 清除, 两者差集里就有全角空格, 结果中文玩家打出的
+            // "B　250" 会被静默判死且零提示。
+            String s = raw.strip().toUpperCase(Locale.ROOT);
             if (s.isEmpty()) {
                 return null;
             }
 
             char marker = 0;
             StringBuilder digits = new StringBuilder();
+            // 去掉指示符与全部空白后剩下的内容, 与 digits 在同一次扫描里产出, 杜绝两套口径打架。
+            StringBuilder body = new StringBuilder();
             for (int i = 0; i < s.length(); i++) {
                 char c = s.charAt(i);
+                if (Character.isWhitespace(c)) {
+                    continue;
+                }
                 if (c == ShopConstants.BUY_MARKER || c == ShopConstants.SELL_MARKER) {
                     if (marker != 0) {
                         return null; // 一侧出现两个指示符 (如 "BS 250") 是歧义, 拒绝。
                     }
                     marker = c;
-                } else if (Character.isDigit(c)) {
+                    continue;
+                }
+                body.append(c);
+                if (isAsciiDigit(c)) {
                     digits.append(c);
-                } else if (!Character.isWhitespace(c) && FREE_UPPER.indexOf(c) < 0) {
+                } else if (FREE_UPPER.indexOf(c) < 0) {
                     // 既非指示符、非数字、非空白、也不属于 FREE 的字符: 拒绝而非静默忽略,
                     // 否则 "B 2O0" (字母 O) 会被读成 20。
                     return null;
@@ -107,15 +119,15 @@ public record ShopPriceLine(Long buyPrice, Long sellPrice) {
                 return null; // 无指示符无法判断买卖方向。
             }
 
-            String body = s.replace(String.valueOf(marker), "").replaceAll("\\s", "");
-            if (body.equalsIgnoreCase(ShopConstants.FREE_KEYWORD)) {
+            String bodyText = body.toString();
+            if (bodyText.equalsIgnoreCase(ShopConstants.FREE_KEYWORD)) {
                 return new Part(marker, 0L);
             }
             if (digits.length() == 0 || digits.length() > MAX_DIGITS) {
                 return null;
             }
-            // 数字与 FREE 字母混写 (如 "B 250 free") 语义矛盾: body 去掉指示符与空白后必须只剩数字。
-            if (body.length() != digits.length()) {
+            // 数字与 FREE 字母混写 (如 "B 250 free") 语义矛盾: body 里必须只剩数字。
+            if (bodyText.length() != digits.length()) {
                 return null;
             }
             long price = Long.parseLong(digits.toString());
@@ -123,6 +135,14 @@ public record ShopPriceLine(Long buyPrice, Long sellPrice) {
                 return null;
             }
             return new Part(marker, price);
+        }
+
+        /**
+         * 只认 ASCII 数字, 不能用 {@link Character#isDigit} —— 它对全角数字 (如 U+FF11) 也返回 true,
+         * 那些字符会被收进 digits 却让 {@link Long#parseLong} 抛 NumberFormatException 冲出解析层。
+         */
+        private static boolean isAsciiDigit(char c) {
+            return c >= '0' && c <= '9';
         }
     }
 }

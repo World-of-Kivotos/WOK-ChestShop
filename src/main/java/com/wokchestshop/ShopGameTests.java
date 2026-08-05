@@ -10,6 +10,7 @@ import net.minecraft.gametest.framework.GameTest;
 import net.minecraft.gametest.framework.GameTestHelper;
 import net.minecraft.nbt.CompoundTag;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.entity.EquipmentSlot;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraftforge.gametest.GameTestHolder;
@@ -146,6 +147,41 @@ public final class ShopGameTests {
         helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "nonsense", "diamond"}).error()
                 == ShopSignSpec.Error.BAD_PRICE, "malformed price rejected");
 
+        // minecraft:air 是注册表正式条目, containsKey 挡不住它。放行的话买入会扣钱且零交付:
+        // AIR 的 ItemStack 恒 isEmpty, Inventory.add 直接 return false 而掉落兜底也不触发。
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 250", "air"}).error()
+                == ShopSignSpec.Error.BAD_ITEM, "literal 'air' rejected (would charge money and deliver nothing)");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 250", "minecraft:air"}).error()
+                == ShopSignSpec.Error.BAD_ITEM, "explicit minecraft:air rejected too");
+
+        helper.succeed();
+    }
+
+    /**
+     * 卖价高于买价 = 低买高卖套利循环, 而管理员店的库存与资金都是无限的。
+     * 最恶劣的变体 "B free:1000 S" 是彻底的零成本印钞。B/S 两数写反比多打一个 0 更常见。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void signSpecRejectsInvertedSpread(GameTestHelper helper) {
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 200:250 S", "diamond"}).error()
+                        == ShopSignSpec.Error.INVERTED_SPREAD,
+                "sell 250 > buy 200 is an arbitrage loop, must be rejected");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "S 250:200 B", "diamond"}).error()
+                        == ShopSignSpec.Error.INVERTED_SPREAD,
+                "same inversion written in the other order is also rejected");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B free:1000 S", "dirt"}).error()
+                        == ShopSignSpec.Error.INVERTED_SPREAD,
+                "'B free:1000 S' is zero-cost money printing, must be rejected");
+
+        // 相等是允许的 (零价差的纯周转店), 正价差当然允许。
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 200:200 S", "diamond"}).ok(),
+                "equal buy and sell is allowed (zero-spread shop)");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 250:200 S", "diamond"}).ok(),
+                "normal positive spread is allowed");
+        // 单向店没有价差可言, 不能被这条闸门误伤。
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "S 1000", "diamond"}).ok(),
+                "a sell-only shop has no spread to invert and must not be blocked");
+
         helper.succeed();
     }
 
@@ -165,6 +201,38 @@ public final class ShopGameTests {
         helper.succeed();
     }
 
+    /**
+     * 中文输入法产出的全角空格 U+3000 必须被当成空白处理。
+     *
+     * 这条不是洁癖: trim() 与正则 \\s 都不认 U+3000, 而 Character.isWhitespace 认。早先版本两套口径
+     * 混用, 结果中文玩家打出的 "B　250" 被静默判死; 抬头行带一个全角空格更糟 —— 匹配失败后 handler
+     * 完全不介入, OP 只会看到原版编辑界面, 零提示零日志。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void parsingHandlesFullWidthWhitespace(GameTestHelper helper) {
+        ShopPriceLine price = ShopPriceLine.parse("B　250:200　S");
+        helper.assertTrue(price != null && price.buyPrice() == 250L && price.sellPrice() == 200L,
+                "full-width spaces inside the price line must parse like normal spaces");
+
+        helper.assertTrue(ShopSignSpec.isAdminShopHeader("管理员商店　"),
+                "a trailing full-width space must not break the Chinese header");
+        helper.assertTrue(ShopSignSpec.isAdminShopHeader("　Admin　Shop　"),
+                "full-width spaces around and inside the English header are normalized");
+
+        // 全角数字必须被干净拒绝, 而不是收进 digits 后让 parseLong 抛异常冲出解析层。
+        helper.assertTrue(ShopPriceLine.parse("B ２５０") == null,
+                "full-width digits are rejected, not crashed on");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "６４", "B 250", "diamond"}).error()
+                == ShopSignSpec.Error.BAD_QUANTITY, "full-width quantity digits rejected cleanly");
+
+        // 整块牌走一遍中文输入法的典型产物。
+        helper.assertTrue(ShopSignSpec.parse(
+                        new String[]{"管理员商店　", "64", "B　250:200　S", "diamond"}).ok(),
+                "a sign typed with a Chinese IME still activates");
+
+        helper.succeed();
+    }
+
     // ============================================================
     // 登记表
     // ============================================================
@@ -174,26 +242,83 @@ public final class ShopGameTests {
         AdminShopRegistry registry = new AdminShopRegistry();
         BlockPos a = new BlockPos(10, 64, -20);
         BlockPos b = new BlockPos(11, 64, -20);
+        ShopSignSpec specA = specOf("Admin Shop", "64", "B 250:200 S", "diamond");
+        ShopSignSpec specB = specOf("Admin Shop", "1", "S 5", "cobblestone");
 
-        helper.assertTrue(!registry.isActivated(a), "a fresh registry activates nothing (no sign is a shop by default)");
-        helper.assertTrue(registry.activate(a), "first activation returns true");
-        helper.assertTrue(!registry.activate(a), "re-activating the same pos is idempotent");
+        helper.assertTrue(registry.recordAt(a) == null,
+                "a fresh registry activates nothing (no sign is a shop by default)");
+        helper.assertTrue(registry.activate(a, specA), "first activation returns true");
+        helper.assertTrue(!registry.activate(a, specA), "re-activating with the same spec is idempotent");
         helper.assertTrue(registry.isActivated(a), "activated pos reads back as activated");
-        helper.assertTrue(!registry.isActivated(b), "an unrelated pos stays inactive");
+        helper.assertTrue(registry.recordAt(b) == null, "an unrelated pos stays inactive");
 
-        registry.activate(b);
+        registry.activate(b, specB);
         helper.assertTrue(registry.size() == 2, "two distinct shops registered");
 
-        // NBT round-trip: 重启后店必须还在, 否则每次重启全服的店都要 OP 重新点一遍。
+        // NBT round-trip: 重启后店必须还在, 且快照的每一项都要原样带回来 —— 快照丢失等于防线消失。
         AdminShopRegistry reloaded = AdminShopRegistry.load(registry.save(new CompoundTag()));
-        helper.assertTrue(reloaded.isActivated(a) && reloaded.isActivated(b),
-                "activations survive save/load");
         helper.assertTrue(reloaded.size() == 2, "no entries lost or duplicated across persistence");
+        AdminShopRegistry.ShopRecord back = reloaded.recordAt(a);
+        helper.assertTrue(back != null, "activation survives save/load");
+        helper.assertTrue(back.quantity() == 64, "quantity survives persistence");
+        helper.assertTrue("minecraft:diamond".equals(back.itemId()), "item id survives persistence");
+        helper.assertTrue(back.buyPrice() == 250L && back.sellPrice() == 200L, "both prices survive persistence");
+        helper.assertTrue(back.matches(specA), "the reloaded snapshot still matches the original spec");
 
-        // 破坏注销必须真的把位置摘掉, 否则同坐标新立的牌会继承"已激活"身份 = 免 OP 开店的提权漏洞。
+        // 单向店的"该方向不营业"哨兵也必须完整往返, 否则重启后 sell-only 店会被误认成 buy 价 0 的免费店。
+        AdminShopRegistry.ShopRecord backB = reloaded.recordAt(b);
+        helper.assertTrue(backB.buyPrice() == AdminShopRegistry.ABSENT_PRICE,
+                "a sell-only shop keeps ABSENT_PRICE for buy across persistence");
+        helper.assertTrue(backB.matches(specB), "sell-only snapshot round-trips");
+
         helper.assertTrue(reloaded.deactivate(a), "deactivate removes the entry");
         helper.assertTrue(!reloaded.isActivated(a), "deactivated pos no longer counts as a shop");
         helper.assertTrue(!reloaded.deactivate(a), "deactivating twice is a no-op");
+
+        helper.succeed();
+    }
+
+    /**
+     * 防"幽灵登记"的主防线。
+     *
+     * 背景: 唯一的注销入口挂在 BlockEvent.BreakEvent 上, 而该事件只在玩家亲手挖掘时触发 —— 拆支撑方块
+     * 致牌脱落、TNT、活塞、水火、/setblock、其它 mod 的 Level.destroyBlock 统统不触发。登记项因此会
+     * 永久残留。若交易准入只查坐标, 任何玩家在残留坐标立一块自己写的牌就白捡一间管理员商店
+     * (写 "B free" 无限白拿, 写 "S 1000000000" 每次左键印上千万信用点)。
+     *
+     * 修法是登记内容快照, 交易前比对。本用例钉死这条比对: 删掉 ShopRecord.matches 的任何一项都会挂。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void registryDetectsSwappedSign(GameTestHelper helper) {
+        AdminShopRegistry registry = new AdminShopRegistry();
+        BlockPos pos = new BlockPos(3, 64, 7);
+        ShopSignSpec authorized = specOf("Admin Shop", "16", "B 250:200 S", "diamond");
+        registry.activate(pos, authorized);
+
+        AdminShopRegistry.ShopRecord record = registry.recordAt(pos);
+        helper.assertTrue(record.matches(authorized), "the exact authorized sign still matches");
+
+        // 攻击者在残留坐标立的牌: 免费白拿。
+        helper.assertTrue(!record.matches(specOf("Admin Shop", "16", "B free", "diamond")),
+                "a free-loot sign at the same pos must NOT match the authorized snapshot");
+        // 攻击者的印钞牌: 天价收购。
+        helper.assertTrue(!record.matches(specOf("Admin Shop", "1", "S 1000000000", "dirt")),
+                "a max-price buyback sign must NOT match");
+        // 只改一项也必须被抓到 —— 逐项比对, 不是"差不多就行"。
+        helper.assertTrue(!record.matches(specOf("Admin Shop", "32", "B 250:200 S", "diamond")),
+                "quantity change alone breaks the match");
+        helper.assertTrue(!record.matches(specOf("Admin Shop", "16", "B 250:200 S", "emerald")),
+                "item change alone breaks the match");
+        helper.assertTrue(!record.matches(specOf("Admin Shop", "16", "B 300:200 S", "diamond")),
+                "buy price change alone breaks the match");
+        helper.assertTrue(!record.matches(specOf("Admin Shop", "16", "B 250:100 S", "diamond")),
+                "sell price change alone breaks the match");
+
+        // OP 改价后重新激活: 快照必须跟着刷新, 否则改完价的店永远交易不了。
+        ShopSignSpec repriced = specOf("Admin Shop", "16", "B 300:200 S", "diamond");
+        registry.activate(pos, repriced);
+        helper.assertTrue(registry.recordAt(pos).matches(repriced), "re-activation refreshes the snapshot");
+        helper.assertTrue(!registry.recordAt(pos).matches(authorized), "the old spec no longer matches");
 
         helper.succeed();
     }
@@ -343,6 +468,87 @@ public final class ShopGameTests {
                 == ShopTransaction.Reason.INSUFFICIENT_ITEMS, "selling NBT-tagged items is refused");
         helper.assertTrue(eco.creditBalance(player) == before, "nothing paid for refused NBT items");
         helper.assertTrue(countInInventory(player, Items.DIAMOND) == 16, "the tagged stack is untouched");
+
+        helper.succeed();
+    }
+
+    /**
+     * NBT 过滤的边界: 必须放行"只有 Damage:0"的全新可损伤物品, 否则管理员永远开不出收购工具的店
+     * (一切工具/武器/盔甲天生自带 {Damage:0}); 但附魔、命名、铁砧代价、损伤过的一律仍要挡住。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void sellAcceptsPristineToolsButRejectsModifiedOnes(GameTestHelper helper) {
+        requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+
+        // 全新铁镐: 自带 {Damage:0}, 必须可卖。
+        player.getInventory().add(new ItemStack(Items.IRON_PICKAXE));
+        helper.assertTrue(ShopTransaction.countSellable(player, Items.IRON_PICKAXE) == 1,
+                "a pristine tool carries {Damage:0} and must still be sellable");
+
+        // 用过的铁镐: isDamaged 挡掉。
+        ItemStack used = new ItemStack(Items.IRON_PICKAXE);
+        used.setDamageValue(5);
+        player.getInventory().add(used);
+        helper.assertTrue(ShopTransaction.countSellable(player, Items.IRON_PICKAXE) == 1,
+                "a damaged tool is not sellable, so the count stays at the one pristine copy");
+
+        // 附魔的铁镐: Damage 之外还有 Enchantments 键, size() > 1 被挡。
+        ItemStack enchanted = new ItemStack(Items.IRON_PICKAXE);
+        enchanted.getOrCreateTag().put(ItemStack.TAG_ENCH, new net.minecraft.nbt.ListTag());
+        player.getInventory().add(enchanted);
+        helper.assertTrue(ShopTransaction.countSellable(player, Items.IRON_PICKAXE) == 1,
+                "an enchanted tool is not sellable (value laundering guard), count still 1");
+
+        // 命名过的铁镐: display 键同理被挡。
+        ItemStack named = new ItemStack(Items.IRON_PICKAXE);
+        named.getOrCreateTag().put(ItemStack.TAG_DISPLAY, new net.minecraft.nbt.CompoundTag());
+        player.getInventory().add(named);
+        helper.assertTrue(ShopTransaction.countSellable(player, Items.IRON_PICKAXE) == 1,
+                "a renamed tool is not sellable, count still 1");
+
+        helper.succeed();
+    }
+
+    /**
+     * 卖出只能动主背包 36 格, 不能碰玩家身上穿的盔甲与副手。
+     *
+     * Inventory.getContainerSize() 是 41 (36+4+1) 且 getItem(i) 会穿透到装备槽, 用它当上界的话,
+     * 玩家戴着崭新钻石头盔去左键 diamond_helmet 收购店, 会把正戴着的头盔直接卖掉 (副手的盾牌/图腾/
+     * 鞘翅同理), 扣的不是玩家以为的那份货。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void sellNeverTakesWornEquipment(GameTestHelper helper) {
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+
+        // 头上戴一顶崭新未附魔的钻石头盔, 副手拿一个崭新盾牌, 主背包里什么都没有。
+        player.setItemSlot(EquipmentSlot.HEAD, new ItemStack(Items.DIAMOND_HELMET));
+        player.setItemSlot(EquipmentSlot.OFFHAND, new ItemStack(Items.SHIELD));
+
+        helper.assertTrue(ShopTransaction.countSellable(player, Items.DIAMOND_HELMET) == 0,
+                "worn armor is not sellable stock");
+        helper.assertTrue(ShopTransaction.countSellable(player, Items.SHIELD) == 0,
+                "offhand item is not sellable stock");
+
+        long before = eco.creditBalance(player);
+        ShopSignSpec helmetShop = specOf("Admin Shop", "1", "S 500", "diamond_helmet");
+        helper.assertTrue(ShopTransaction.sell(player, helmetShop).reason()
+                == ShopTransaction.Reason.INSUFFICIENT_ITEMS, "selling with only worn armor must fail");
+        helper.assertTrue(eco.creditBalance(player) == before, "nothing paid");
+        helper.assertTrue(!player.getInventory().armor.get(3).isEmpty(),
+                "the worn helmet is still on the player's head");
+        helper.assertTrue(!player.getInventory().offhand.get(0).isEmpty(),
+                "the offhand shield is untouched");
+
+        // 背包里另有一顶时, 卖掉的必须是背包那顶, 头上那顶不动。
+        player.getInventory().add(new ItemStack(Items.DIAMOND_HELMET));
+        int stock = ShopTransaction.countSellable(player, Items.DIAMOND_HELMET);
+        helper.assertTrue(stock == 1,
+                "only the inventory copy counts as stock (actual=" + stock + ")");
+        helper.assertTrue(ShopTransaction.sell(player, helmetShop).ok(), "selling the inventory copy succeeds");
+        helper.assertTrue(!player.getInventory().armor.get(3).isEmpty(),
+                "the worn helmet survives a successful sale of the spare one");
 
         helper.succeed();
     }

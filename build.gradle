@@ -109,4 +109,6 @@ tasks.named('jar', Jar).configure {
 tasks.withType(JavaCompile).configureEach {
     options.encoding = 'UTF-8'
     options.release = 17
+    // 明示过时 API 的具体位置: 默认 javac 只说"用到了过时 API"却不说是哪一处, 等于没说。
+    options.compilerArgs << '-Xlint:deprecation'
 }
