@@ -1,0 +1,112 @@
+plugins {
+    id 'eclipse'
+    id 'idea'
+    id 'net.minecraftforge.gradle'
+    id 'org.parchmentmc.librarian.forgegradle'
+    id 'java'
+}
+
+version = "${mod_version}"
+group = "${mod_group}"
+
+base {
+    archivesName = "${mod_id}-${mc_version}"
+}
+
+// 与主 mod 同锁 Java 17 (--release 17): 跨 mod 调用双方字节码版本必须一致
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+}
+
+minecraft {
+    // 与主 mod 同一 parchment 版本: 跨仓引用 net.minecraft.* 时参数名/映射一致, 避免两边对同一方法的认知分叉
+    mappings channel: 'parchment', version: "${parchment_version}-${parchment_minecraft}"
+
+    runs {
+        configureEach {
+            workingDirectory project.file('run')
+            property 'forge.logging.markers', 'REGISTRIES'
+            property 'forge.logging.console.level', 'debug'
+            mods {
+                "${mod_id}" {
+                    source sourceSets.main
+                }
+            }
+        }
+
+        client {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+
+        server {
+            property 'forge.enabledGameTestNamespaces', mod_id
+            args '--nogui'
+        }
+
+        gameTestServer {
+            property 'forge.enabledGameTestNamespaces', mod_id
+        }
+    }
+}
+
+repositories {
+    mavenCentral()
+    maven { url = 'https://maven.minecraftforge.net/' }
+    maven { url = 'https://maven.parchmentmc.org/' }
+    // 主 mod 走 flatDir 而非 files(): fg.deobf 对 files() 型依赖会静默降级
+    //   ("Cannot deobfuscate dependency of type DefaultSelfResolvingDependency, using obfuscated version!"),
+    //   结果是编译能过 (主 mod 自身的类名/方法名不受 SRG 影响) 但 dev 运行期加载的是 SRG 态主 mod,
+    //   其内部对 MC 的调用全部 NoSuchMethodError。只有 flatDir 型依赖才会真正过 deobf 流程。
+    flatDir {
+        dir 'libs'
+    }
+}
+
+dependencies {
+    minecraft "net.minecraftforge:forge:${forge_full_version}"
+
+    // 主 mod (miningdim) 依赖 —— 用 fg.deobf 而非 compileOnly, 这是本工程的关键取舍:
+    //
+    //   build/libs 里的主 mod jar 是 reobf(SRG) 态产物。若照搬主 mod 对 TACZ/Champions 的 compileOnly 范式,
+    //   编译能过但 dev 运行期 classpath 里没有 miningdim, 本 mod 一调 EconomyServices 就 ClassNotFound,
+    //   GameTest 将完全无法覆盖经济接入 —— 而经济接入恰恰是本 mod 的全部价值所在。
+    //
+    //   主 mod 之所以能走 fg.deobf 而 TACZ/Champions 不能: 那两者带 SRG 态 mixin + refmap, FG 无法 deobf,
+    //   在 dev 加载即因找不到官方映射目标 FATAL 崩服; 主 mod 全库零 mixin (src/main/resources 无 mixins.json,
+    //   无 org.spongepowered.asm 引用, 已由审计核实), 故 fg.deobf 能干净地把 SRG 映射还原成 dev 官方映射,
+    //   使主 mod 真实上 dev classpath, GameTest 可以真调账本、真扣钱、真发钱。
+    //
+    //   连带约束: 主 mod 的 economy 包一旦改动公共签名, 必须重新 build 主 mod 并更新 libs/ 下的 jar。
+    //   坐标形如 group:name:version, 由上面的 flatDir 解析到 libs/miningdim-1.20.1-1.0.0.jar
+    //   (flatDir 忽略 group, 按 name-version 匹配文件名)。
+    implementation fg.deobf("${miningdim_group}:${miningdim_artifact}:${miningdim_version}")
+
+    // 主 mod 的 dev 运行期传递依赖 —— 必须在这里重复声明一次。
+    //   flatDir 型依赖不带 POM, 拿不到被依赖方的传递依赖; 主 mod 的跳蚤市场存储层在服务端启动时
+    //   经 Class.forName 加载 SQLite JDBC 驱动, 缺了它主 mod 的 MarketSubsystem 直接崩服,
+    //   本 mod 的 GameTest 一个都跑不起来。主 mod 生产环境靠 jarJar 内嵌该驱动, 但 FG 的 dev run
+    //   classpath 由 minecraft/forge 配置集生成、不含 jarJar 内嵌件, 故 dev 侧必须走 minecraftLibrary
+    //   (与主 mod build.gradle 里同名声明同理同版本, 升级时两边必须同步)。
+    minecraftLibrary 'org.xerial:sqlite-jdbc:3.45.3.0'
+}
+
+tasks.named('jar', Jar).configure {
+    manifest {
+        attributes([
+            'Specification-Title'     : mod_id,
+            'Specification-Vendor'    : mod_authors,
+            'Specification-Version'   : '1',
+            'Implementation-Title'    : project.name,
+            'Implementation-Version'  : project.jar.archiveVersion,
+            'Implementation-Vendor'   : mod_authors,
+        ])
+    }
+    finalizedBy 'reobfJar'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 17
+}

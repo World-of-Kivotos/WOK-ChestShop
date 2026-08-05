@@ -1,0 +1,20 @@
+# Gradle / 构建产物
+build/
+.gradle/
+out/
+bin/
+
+# ForgeGradle dev 运行目录 (world 存档、日志、崩溃报告、server.properties)
+run/
+
+# 主 mod 依赖 jar 是构建产物, 由 tools/prepare-miningdim-dep.ps1 从主 mod 工程生成, 不进版本库
+libs/*.jar
+
+# IDE
+.idea/
+*.iml
+.eclipse/
+.settings/
+.classpath
+.project
+.vscode/

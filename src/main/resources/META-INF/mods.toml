@@ -1,0 +1,41 @@
+# WOK ChestShop - mods.toml
+# 平台锁定: MC 1.20.1 + Forge 47.x, 与主 mod (miningdim) 逐字一致。
+modLoader = "javafml"
+loaderVersion = "[47,)"
+license = "AGPL-3.0-or-later"
+issueTrackerURL = "https://github.com/World-of-Kivotos/WOK-ChestShop/issues"
+
+[[mods]]
+modId = "wokchestshop"
+version = "${file.jarVersion}"
+displayName = "WOK ChestShop"
+authors = "ShinoyukiMiyako"
+description = '''
+告示牌管理员商店: 沿用 ChestShop 的四行告示牌定价格式, 接入 Mining Dimension System 的信用点账本。
+玩家右键买入 / 左键卖出, 系统侧无限库存; 卖出收益并入主 mod 每人每日信用点衰减主闸。
+'''
+
+[[dependencies.wokchestshop]]
+modId = "forge"
+mandatory = true
+versionRange = "[47,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.wokchestshop]]
+modId = "minecraft"
+mandatory = true
+versionRange = "[1.20.1,1.20.2)"
+ordering = "NONE"
+side = "BOTH"
+
+# 主 mod 硬依赖: 本 mod 的全部价值就是把告示牌商店接到 miningdim 的信用点账本上,
+# 缺了它没有任何可降级的功能, 故 mandatory=true 直接拒绝加载 (不做运行期 ModList 探测的松散接线 ——
+# 主 mod 审计里"装上 champions 即静默清零奖励"那颗地雷正是松散接线的产物)。
+# ordering=AFTER 保证 miningdim 的 EconomyServices 定位器先于本 mod 的服务端启动回调注入。
+[[dependencies.wokchestshop]]
+modId = "miningdim"
+mandatory = true
+versionRange = "[1.0.0,)"
+ordering = "AFTER"
+side = "BOTH"
