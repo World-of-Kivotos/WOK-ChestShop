@@ -1,0 +1,21 @@
+{
+  "message.wokchestshop.activated": "管理员商店已激活：每次 %s 个 %s，%s（告示牌已上蜡，改价需先撬蜡）",
+  "message.wokchestshop.bought": "已买入 %s 个 %s，支付 %s 信用点。",
+  "message.wokchestshop.sold": "已卖出 %s 个 %s，获得 %s 信用点。",
+  "message.wokchestshop.sold_decayed": "已卖出 %s 个 %s，实得 %s 信用点（标价 %s，当日收益已衰减）。",
+  "message.wokchestshop.price_both": "买 %s / 卖 %s",
+  "message.wokchestshop.price_buy_only": "买 %s（不收购）",
+  "message.wokchestshop.price_sell_only": "卖 %s（不出售）",
+  "message.wokchestshop.ok": "交易完成。",
+  "message.wokchestshop.err.not_admin_shop": "这不是一块管理员商店告示牌。",
+  "message.wokchestshop.err.bad_quantity": "第 2 行数量非法：只能填 1 到 2304 的纯数字。",
+  "message.wokchestshop.err.bad_item": "第 4 行物品 ID 不存在，例如 diamond 或 minecraft:diamond。",
+  "message.wokchestshop.err.bad_price": "第 3 行价格格式非法，例如 B 250:200 S、B 250、S 200 或 B free。",
+  "message.wokchestshop.err.inverted_spread": "卖价不能高于买价（会被低买高卖套利）。请检查 B 和 S 两个数字是否写反了。",
+  "message.wokchestshop.err.tampered": "这块告示牌的内容与激活时不一致，商店已停用，请管理员重新激活。",
+  "message.wokchestshop.err.protected": "这是已激活的管理员商店，只有管理员可以拆除。",
+  "message.wokchestshop.err.direction": "本店不做这个方向的交易。",
+  "message.wokchestshop.err.funds": "信用点不足。",
+  "message.wokchestshop.err.items": "背包里没有足够的该物品（带附魔、损伤或自定义数据的物品不可出售）。",
+  "message.wokchestshop.err.economy": "经济系统尚未就绪，请稍后再试。"
+}
