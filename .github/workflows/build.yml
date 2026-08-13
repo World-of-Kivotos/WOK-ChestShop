@@ -1,0 +1,182 @@
+name: 构建
+
+# 本工程无法独立构建: 编译与 dev 运行都要主 mod (miningdim) 的 economy 门面, 而该门面 jar 是构建产物,
+# 按 .gitignore 的既定纪律不入库。故 CI 必须现场从主仓源码构建出它 —— 顺带的好处是主 mod 一旦改动
+# economy 公共签名, 这里立刻红, 不会等到真服才发现两仓脱节。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 冷跑 20 分钟量级, 同分支的新提交直接取代旧运行, 不排队叠积
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # 与 gradle.properties 的 miningdim_artifact-miningdim_version 逐字一致 (flatDir 按文件名匹配)
+  MININGDIM_JAR: miningdim-1.20.1-1.0.0.jar
+
+jobs:
+  build:
+    name: 构建并跑 GameTest
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 检出本仓库
+        uses: actions/checkout@v7
+        with:
+          path: chestshop
+
+      - name: 检出主 mod (miningdim)
+        uses: actions/checkout@v7
+        with:
+          repository: World-of-Kivotos/Wok-Project
+          ref: main
+          path: miningdim
+
+      - name: 安装 JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: 恢复 Gradle 缓存
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('chestshop/**/*.gradle', 'chestshop/gradle.properties', 'chestshop/gradle/wrapper/gradle-wrapper.properties', 'miningdim/**/*.gradle', 'miningdim/gradle.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      - name: 恢复第三方 mod 依赖缓存
+        uses: actions/cache@v6
+        with:
+          path: miningdim/libs
+          key: modjars-tacz1.1.8hotfix-champions2.1.10.2-mcef2.1.6
+
+      - name: 下载主 mod 的第三方编译依赖
+        run: |
+          set -euo pipefail
+          # 主 mod 对 TACZ/Champions/MCEF 是 compileOnly, 三个 jar 同样不入库 (体积大且属第三方)。
+          # URL 走 Modrinth CDN 的不可变版本路径 + sha512 校验, 换版本时连同 hash 一起改, 并与主仓
+          # build.gradle 里 compileOnly 引用的文件名保持逐字一致。
+          mkdir -p miningdim/libs
+          cd miningdim/libs
+          fetch() {
+            local url="$1" name="$2" sha="$3"
+            if [ -f "$name" ]; then
+              echo "命中缓存: $name"
+            else
+              echo "下载: $name"
+              curl -fsSL --retry 3 --retry-delay 5 -o "$name" "$url"
+            fi
+            echo "$sha  $name" | sha512sum -c -
+          }
+          fetch \
+            'https://cdn.modrinth.com/data/SzzJttH8/versions/yOVIzIJR/tacz-1.20.1-1.1.8-hotfix.jar' \
+            'tacz-1.20.1-1.1.8-hotfix.jar' \
+            'bf35bd51dfe39fdffc3f4f7b6695e85348b64807e2977bca813decdfbe4c2d7cd5e15c437e42a012aaa067e271b02cd92f3d32e4fa08d36fedc141e668a115c6'
+          fetch \
+            'https://cdn.modrinth.com/data/VJZc5cJx/versions/lC2uBBu2/champions-forge-1.20.1-2.1.10.2.jar' \
+            'champions-forge-1.20.1-2.1.10.2.jar' \
+            '1712ea49acb28a2ce624fcd0a3f82c28c38db8691b7e7498f5d14e77dd0abdb6b186ddade2f9e2f97dcaf1863c4bbc2cfbfa84eae095d5ba6d6f9a79329f7998'
+          fetch \
+            'https://cdn.modrinth.com/data/TObQ0HxZ/versions/x91l6OKB/mcef-forge-2.1.6-1.20.1.jar' \
+            'mcef-forge-2.1.6-1.20.1.jar' \
+            '6df8c8e70ab15b3662404a3a398c18689fb7591e84e1a913d8939bee144f030cd2aeaee4e68f1ed159881a59796a37a7f628dd442e6ba7836005e14ad7b9704d'
+
+      - name: 构建主 mod
+        working-directory: miningdim
+        run: |
+          set -euo pipefail
+          # 两仓的 gradlew 都以 100644 入库 (Windows 侧开发), Linux runner 上必须自己补执行位
+          chmod +x gradlew
+          # -x test 与 tools/prepare-miningdim-dep.ps1 一致: 主 mod 的测试是 GameTest, 不走 test 任务
+          ./gradlew build -x test --console=plain --stacktrace
+
+      - name: 生成本工程的 miningdim 依赖 jar
+        run: |
+          set -euo pipefail
+          shopt -s globstar nullglob
+          # 本步骤是 tools/prepare-miningdim-dep.ps1 的 Linux 对等实现, 两边逻辑必须同步修改。
+          # 坑 1 (剥离 GameTest 类): fg.deobf 不还原注解【元素名】的映射, 主 mod 的 @BeforeBatch(batch = ...)
+          #   deobf 后元素名仍是 SRG 名, dev 端 Forge 注册 GameTest 时读不到该元素, 抛
+          #   IncompleteAnnotationException 直接崩服, 本工程一个测试都跑不起来。
+          # 坑 2 (用 jar 重打包) 是 PowerShell ZipArchive 特有的, Linux 侧本来就用 jar, 天然规避。
+          src="$GITHUB_WORKSPACE/miningdim/build/libs/$MININGDIM_JAR"
+          test -f "$src" || { echo "主 mod 产物不存在: $src"; exit 1; }
+
+          work="$(mktemp -d)"
+          cd "$work"
+          jar xf "$src"
+
+          victims=(**/*GameTests*.class)
+          if [ ${#victims[@]} -eq 0 ]; then
+            echo "未找到任何 GameTest 类 —— 主 mod 产物结构与预期不符, 拒绝继续"
+            exit 1
+          fi
+          echo "剥离 ${#victims[@]} 个 GameTest 类"
+          rm -f "${victims[@]}"
+
+          # 本工程的 GameTest 要用它造真 ServerPlayer, 剥错了会连带删掉
+          mocks=(com/miningdim/testutil/MockGameTestPlayers*.class)
+          if [ ${#mocks[@]} -eq 0 ]; then
+            echo "MockGameTestPlayers 被误删 —— 本工程的 GameTest 依赖它造真 ServerPlayer"
+            exit 1
+          fi
+
+          manifest="$(mktemp)"
+          cp META-INF/MANIFEST.MF "$manifest"
+          rm META-INF/MANIFEST.MF   # 避免与 -m 传入的 manifest 重复成为普通条目
+
+          mkdir -p "$GITHUB_WORKSPACE/chestshop/libs"
+          jar cfm "$GITHUB_WORKSPACE/chestshop/libs/$MININGDIM_JAR" "$manifest" .
+          ls -l "$GITHUB_WORKSPACE/chestshop/libs/$MININGDIM_JAR"
+
+      - name: 清理 ForgeGradle deobf 缓存
+        run: |
+          set -euo pipefail
+          # 坐标恒为 com.miningdim:miningdim-1.20.1:1.0.0 而内容每次现构建都不同, 不清就会命中上一轮
+          # 缓存里的旧主 mod, CI 变成对着历史版本刷绿。恢复自缓存的 ~/.gradle 尤其会踩这条。
+          rm -rf ~/.gradle/caches/forge_gradle/bundled_deobf_repo/com/miningdim \
+                 ~/.gradle/caches/forge_gradle/deobf_dependencies/com/miningdim
+
+      - name: 构建本 mod
+        working-directory: chestshop
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew build --console=plain --stacktrace
+
+      - name: 跑 GameTest
+        working-directory: chestshop
+        run: ./gradlew runGameTestServer --console=plain --stacktrace
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: wokchestshop-${{ github.sha }}
+          path: chestshop/build/libs/*.jar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: 上传失败现场
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failure-logs-${{ github.sha }}
+          path: |
+            chestshop/run/logs/
+            chestshop/run/crash-reports/
+            miningdim/build/reports/
+          if-no-files-found: ignore
+          retention-days: 14
