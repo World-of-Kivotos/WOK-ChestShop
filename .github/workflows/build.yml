@@ -20,7 +20,8 @@ permissions:
   contents: read
 
 env:
-  # 与 gradle.properties 的 miningdim_artifact-miningdim_version 逐字一致 (flatDir 按文件名匹配)
+  # 本工程 libs/ 下的目标文件名, 与 gradle.properties 的 miningdim_artifact-miningdim_version 逐字一致
+  # (flatDir 按文件名匹配)。主 mod 产物本身带真实版本号, 在下面按 miningdim-1.20.1-*.jar 匹配。
   MININGDIM_JAR: miningdim-1.20.1-1.0.0.jar
 
 jobs:
@@ -112,8 +113,19 @@ jobs:
           #   deobf 后元素名仍是 SRG 名, dev 端 Forge 注册 GameTest 时读不到该元素, 抛
           #   IncompleteAnnotationException 直接崩服, 本工程一个测试都跑不起来。
           # 坑 2 (用 jar 重打包) 是 PowerShell ZipArchive 特有的, Linux 侧本来就用 jar, 天然规避。
-          src="$GITHUB_WORKSPACE/miningdim/build/libs/$MININGDIM_JAR"
-          test -f "$src" || { echo "主 mod 产物不存在: $src"; exit 1; }
+          # 坑 3 (剥离 mixin 配置): 主 mod 已不再零 mixin, fg.deobf 不改写 SRG refmap, dev 下对不上目标;
+          #   本工程只用 economy 门面, 连同 MANIFEST 的 MixinConfigs 与 jarJar 内嵌件一起去掉。
+          # 主 mod 产物带真实版本号 (miningdim-1.20.1-<mod_version>.jar), 取普通 reobf jar, 排除 -all/-sources。
+          candidates=()
+          for f in "$GITHUB_WORKSPACE"/miningdim/build/libs/miningdim-1.20.1-*.jar; do
+            case "$f" in *-all.jar|*-sources.jar|*-slim.jar|*-dev.jar) ;; *) candidates+=("$f") ;; esac
+          done
+          if [ ${#candidates[@]} -ne 1 ]; then
+            echo "主 mod 产物应恰好一个, 实际 ${#candidates[@]} 个: ${candidates[*]:-无}"
+            exit 1
+          fi
+          src="${candidates[0]}"
+          echo "使用主 mod 产物: $src"
 
           work="$(mktemp -d)"
           cd "$work"
@@ -134,8 +146,13 @@ jobs:
             exit 1
           fi
 
+          mixin_configs=(*.mixins.json)
+          echo "剥离 ${#mixin_configs[@]} 份 mixin 配置"
+          rm -f "${mixin_configs[@]}"
+          rm -rf META-INF/jarjar
+
           manifest="$(mktemp)"
-          cp META-INF/MANIFEST.MF "$manifest"
+          grep -v '^MixinConfigs' META-INF/MANIFEST.MF > "$manifest"
           rm META-INF/MANIFEST.MF   # 避免与 -m 传入的 manifest 重复成为普通条目
 
           mkdir -p "$GITHUB_WORKSPACE/chestshop/libs"
