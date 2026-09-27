@@ -6,6 +6,7 @@ import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
 import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.level.Level;
 import net.minecraft.world.level.block.entity.BlockEntity;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
@@ -37,6 +38,8 @@ import java.util.UUID;
  *  3. 距离与区块校验 —— 左键路径跑在原版 canReach/mayInteract 之前, 必须自行补齐, 否则改包客户端
  *     可隔墙交易, 更严重的是乱填坐标会让 getBlockEntity 同步强制加载任意区块拖垮主线程。
  *  4. 交易防抖 —— 客户端会按 tick 节律重发交互包, 只过滤 Action.START 挡不住连刷。
+ *  5. 两步激活 —— 牌面文字任何人都能写, 激活只看一次 OP 右键。玩家写一块 "B free" 再骗 OP 过来右键,
+ *     就白得一间免费商店。第一次右键只回显完整条款, 窗口内内容不变再右键才生效。
  */
 public final class ShopInteractionHandler {
 
@@ -66,6 +69,26 @@ public final class ShopInteractionHandler {
     private final Map<UUID, LastTrade> lastTrades = new HashMap<>();
 
     private record LastTrade(long gameTime, long posKey) {
+    }
+
+    /**
+     * (OP UUID -> 待确认的激活)。第一次右键只登记在这里并回显完整条款, 窗口内第二次右键且内容不变才激活,
+     * 见 {@link ShopConstants#ACTIVATION_CONFIRM_TICKS}。每个 OP 同时最多一条, 新预览覆盖旧预览。
+     */
+    private final Map<UUID, PendingActivation> pendingActivations = new HashMap<>();
+
+    /**
+     * @param spec   预览时解析出的牌面规格 (record 相等 = 牌面内容没变)
+     * @param sample 预览时主手的样品 (样品店); 物品 id 店为 {@link ItemStack#EMPTY}
+     */
+    private record PendingActivation(long posKey, ShopSignSpec spec, ItemStack sample, long expiresAt) {
+
+        boolean confirmedBy(long posKey, ShopSignSpec spec, ItemStack sample, long now) {
+            return this.posKey == posKey
+                    && now <= expiresAt
+                    && this.spec.equals(spec)
+                    && ItemStack.isSameItemSameTags(this.sample, sample);
+        }
     }
 
     // ============================================================
@@ -119,7 +142,14 @@ public final class ShopInteractionHandler {
         if (!passCooldown(player, pos)) {
             return;
         }
-        report(player, ShopTransaction.buy(player, spec), spec, true);
+        // 交付的是快照里的商品 (样品店是激活时那件样品), 不是按牌面现造的 —— 牌面玩家能动, 快照只有 OP 能换。
+        ItemStack goods = record.goods();
+        ShopTransaction.Outcome outcome = ShopTransaction.buy(player, spec, goods);
+        if (outcome.reason() == ShopTransaction.Reason.GOODS_UNAVAILABLE) {
+            LOGGER.error("[wokchestshop] shop goods unavailable (sample item no longer registered?): dim={} pos={} item={}",
+                    level.dimension().location(), pos, record.itemId());
+        }
+        report(player, outcome, goods, spec.quantity(), true);
     }
 
     // ============================================================
@@ -178,7 +208,7 @@ public final class ShopInteractionHandler {
         if (!passCooldown(player, pos)) {
             return;
         }
-        report(player, ShopTransaction.sell(player, spec), spec, false);
+        report(player, ShopTransaction.sell(player, spec), record.goods(), spec.quantity(), false);
     }
 
     // ============================================================
@@ -216,16 +246,48 @@ public final class ShopInteractionHandler {
     // 激活
     // ============================================================
 
+    /**
+     * OP 右键一块未激活的商店牌: 第一次只预览, 窗口内内容不变 (样品店还要同一件样品) 再右键一次才激活。
+     *
+     * 第一次右键不做任何持久化改动 (不登记、不上蜡), 所以被骗来右键一下的 OP 什么都不会发生,
+     * 只会在聊天栏里看到这块牌的完整条款。
+     */
     private void activate(ServerPlayer player, ServerLevel level, AdminShopRegistry registry,
                           SignBlockEntity sign, BlockPos pos) {
         ShopSignSpec.Result parsed = ShopSignSpec.parse(readLines(sign));
         if (!parsed.ok()) {
+            pendingActivations.remove(player.getUUID());
             player.sendSystemMessage(Component.translatable(errorKey(parsed.error())));
             return;
         }
 
         ShopSignSpec spec = parsed.spec();
-        registry.activate(pos, spec);
+        ItemStack sample = ItemStack.EMPTY;
+        if (spec.isTemplate()) {
+            ItemStack held = player.getMainHandItem();
+            if (held.isEmpty()) {
+                pendingActivations.remove(player.getUUID());
+                player.sendSystemMessage(Component.translatable("message.wokchestshop.err.template_missing"));
+                return;
+            }
+            sample = held.copyWithCount(1);
+        }
+
+        long now = level.getGameTime();
+        PendingActivation pending = pendingActivations.get(player.getUUID());
+        if (pending == null || !pending.confirmedBy(pos.asLong(), spec, sample, now)) {
+            pendingActivations.put(player.getUUID(),
+                    new PendingActivation(pos.asLong(), spec, sample, now + ShopConstants.ACTIVATION_CONFIRM_TICKS));
+            ItemStack shown = spec.isTemplate() ? sample : new ItemStack(spec.item());
+            player.sendSystemMessage(Component.translatable(
+                    "message.wokchestshop.confirm_activation",
+                    spec.quantity(), goodsName(shown), describePrice(spec.price()),
+                    ShopConstants.ACTIVATION_CONFIRM_TICKS / 20));
+            return;
+        }
+        pendingActivations.remove(player.getUUID());
+
+        registry.activate(pos, spec, sample);
 
         // 上蜡: 冻结文本编辑, 免得 OP 自己或别人顺手把买价改成 1。这是辅助闸不是主防线 ——
         // 蜜脾任何玩家都能用, "已上蜡"不等于"被授权", 真正承重的是上面那条内容快照。
@@ -236,14 +298,17 @@ public final class ShopInteractionHandler {
             level.sendBlockUpdated(pos, state, state, BLOCK_UPDATE_CLIENTS);
         }
 
-        LOGGER.info("[wokchestshop] admin shop activated: dim={} pos={} item={} qty={} buy={} sell={} by={}",
-                level.dimension().location(), pos, spec.item(), spec.quantity(),
-                spec.price().buyPrice(), spec.price().sellPrice(), player.getGameProfile().getName());
+        AdminShopRegistry.ShopRecord record = registry.recordAt(pos);
+        // 样品的完整 NBT 进日志: 样品店卖的到底是什么, 事后只能靠这一行核对 (牌面上只有显示名)。
+        LOGGER.info("[wokchestshop] admin shop activated: dim={} pos={} item={} label={} qty={} buy={} sell={} sample={} by={}",
+                level.dimension().location(), pos, record.itemId(), record.templateLabel(), spec.quantity(),
+                spec.price().buyPrice(), spec.price().sellPrice(),
+                record.isTemplate() ? record.template() : "-", player.getGameProfile().getName());
 
         player.sendSystemMessage(Component.translatable(
                 "message.wokchestshop.activated",
                 spec.quantity(),
-                Component.translatable(spec.item().getDescriptionId()),
+                goodsName(record.goods()),
                 describePrice(spec.price())));
     }
 
@@ -374,26 +439,38 @@ public final class ShopInteractionHandler {
         return serverPlayer.getServer().getPlayerList().isOp(serverPlayer.getGameProfile());
     }
 
-    private void report(ServerPlayer player, ShopTransaction.Outcome outcome, ShopSignSpec spec, boolean buying) {
+    private void report(ServerPlayer player, ShopTransaction.Outcome outcome, ItemStack goods, int quantity,
+                        boolean buying) {
         if (!outcome.ok()) {
             player.sendSystemMessage(Component.translatable(reasonKey(outcome.reason())));
             return;
         }
-        Component itemName = Component.translatable(spec.item().getDescriptionId());
+        Component itemName = goodsName(goods);
         if (buying) {
             player.sendSystemMessage(Component.translatable(
-                    "message.wokchestshop.bought", spec.quantity(), itemName, outcome.settled()));
+                    "message.wokchestshop.bought", quantity, itemName, outcome.settled()));
             return;
         }
         // 卖出实发额低于标价 = 撞上了主 mod 的每日 faucet 衰减主闸。必须明示, 否则玩家会以为商店少给钱。
         if (outcome.settled() < outcome.listed()) {
             player.sendSystemMessage(Component.translatable(
                     "message.wokchestshop.sold_decayed",
-                    spec.quantity(), itemName, outcome.settled(), outcome.listed()));
+                    quantity, itemName, outcome.settled(), outcome.listed()));
         } else {
             player.sendSystemMessage(Component.translatable(
-                    "message.wokchestshop.sold", spec.quantity(), itemName, outcome.settled()));
+                    "message.wokchestshop.sold", quantity, itemName, outcome.settled()));
         }
+    }
+
+    /**
+     * 聊天栏里的商品名。带 NBT 的 (样品店) 用原版的 [名称] 形式, 鼠标悬停能看到完整物品提示 ——
+     * 枪的型号、子弹口径、图纸内容都在提示里, 牌面上只有显示名, OP 确认激活和玩家核对买到了什么都靠它。
+     */
+    private static Component goodsName(ItemStack goods) {
+        if (goods.isEmpty()) {
+            return Component.literal("?");
+        }
+        return goods.hasTag() ? goods.getDisplayName() : Component.translatable(goods.getDescriptionId());
     }
 
     /** 把价格行渲染成给人看的一句话 (激活回执用)。 */
@@ -413,6 +490,7 @@ public final class ShopInteractionHandler {
             case BAD_ITEM -> "message.wokchestshop.err.bad_item";
             case BAD_PRICE -> "message.wokchestshop.err.bad_price";
             case INVERTED_SPREAD -> "message.wokchestshop.err.inverted_spread";
+            case TEMPLATE_SELL_UNSUPPORTED -> "message.wokchestshop.err.template_sell";
         };
     }
 
@@ -423,6 +501,7 @@ public final class ShopInteractionHandler {
             case INSUFFICIENT_FUNDS -> "message.wokchestshop.err.funds";
             case INSUFFICIENT_ITEMS -> "message.wokchestshop.err.items";
             case ECONOMY_UNAVAILABLE -> "message.wokchestshop.err.economy";
+            case GOODS_UNAVAILABLE -> "message.wokchestshop.err.goods_unavailable";
         };
     }
 }

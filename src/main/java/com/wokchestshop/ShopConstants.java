@@ -7,7 +7,7 @@ package com.wokchestshop;
  *   第 1 行 店主 (本 mod 只做管理员商店, 故固定为 {@link #ADMIN_SHOP_KEYWORDS} 之一)
  *   第 2 行 每次交易数量
  *   第 3 行 价格 (B 买价 : 卖价 S)
- *   第 4 行 物品 id
+ *   第 4 行 物品 id, 或 {@link #TEMPLATE_PREFIX} + 显示名 (样品商店, 见 {@link ShopSignSpec})
  */
 public final class ShopConstants {
 
@@ -51,4 +51,28 @@ public final class ShopConstants {
 
     /** 买卖价分隔符。 */
     public static final char PRICE_SEPARATOR = ':';
+
+    /**
+     * 第 4 行以此开头 = 样品商店: 商品不是"某个物品 id 的素材", 而是 OP 激活时主手拿着的那件样品 (连同 NBT)。
+     *
+     * 为什么需要: TaCZ 的所有枪共用一个物品 id (tacz:modern_kinetic_gun), 型号写在 NBT 的 GunId 里; 子弹、
+     * 枪匠图纸同理。只认物品 id 的告示牌卖出去的是一把没有型号的空壳枪。样品随激活快照存进登记表,
+     * 牌面只写给人看的显示名。
+     */
+    public static final char TEMPLATE_PREFIX = '@';
+
+    /**
+     * 样品商店显示名的最大字数。告示牌一行本来就放不下太长的字, 更要紧的是显示名参与内容快照比对,
+     * 限长让它保持"一眼能核对"的短标签, 而不是塞进一段描述。
+     */
+    public static final int MAX_TEMPLATE_LABEL_LENGTH = 15;
+
+    /**
+     * 激活确认窗口 (tick)。OP 第一次右键只预览, 窗口内对同一块牌、同样内容 (样品店还要同一件样品)
+     * 再右键一次才真正激活。
+     *
+     * 为什么要两步: 激活只要一次 OP 右键, 而牌面文字任何玩家都能写。玩家立一块 "B free" 的牌再骗 OP
+     * 过来右键一下, 就白得一间免费管理员商店。两步确认让 OP 在生效前必定先看到一遍完整条款。
+     */
+    public static final long ACTIVATION_CONFIRM_TICKS = 200L;
 }

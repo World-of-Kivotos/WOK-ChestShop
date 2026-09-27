@@ -37,7 +37,9 @@ public final class ShopTransaction {
         /** 玩家背包里没有足够的、无损伤无 NBT 的该物品。 */
         INSUFFICIENT_ITEMS,
         /** 主 mod 经济门面尚未注入 (服务端启动中或矿山维度缺失)。 */
-        ECONOMY_UNAVAILABLE
+        ECONOMY_UNAVAILABLE,
+        /** 商品已不可交付 (样品所属的 mod 被移除, 读出来是空栈)。必须在扣钱前挡住。 */
+        GOODS_UNAVAILABLE
     }
 
     /**
@@ -63,8 +65,24 @@ public final class ShopTransaction {
      * 剩余部分掉在玩家脚下而不是静默蒸发 —— 玩家已经付过钱了, 任何情况下都必须拿到等量的货。
      */
     public static Outcome buy(ServerPlayer player, ShopSignSpec spec) {
+        if (spec.isTemplate()) {
+            // 样品店的商品在登记表的快照里, 光凭牌面规格交付不出来; 走下面带样品的重载。
+            throw new IllegalArgumentException("template shop needs its goods: " + spec.templateLabel());
+        }
+        return buy(player, spec, new ItemStack(spec.item()));
+    }
+
+    /**
+     * 按给定商品原型交付 (样品店传快照里的样品, 物品 id 店传该物品的新栈)。
+     *
+     * @param goods 一件商品的原型; 交付 {@code spec.quantity()} 个与它 NBT 完全相同的复制品
+     */
+    public static Outcome buy(ServerPlayer player, ShopSignSpec spec, ItemStack goods) {
         if (!spec.price().allowsBuy()) {
             return Outcome.fail(Reason.DIRECTION_UNSUPPORTED);
+        }
+        if (goods == null || goods.isEmpty()) {
+            return Outcome.fail(Reason.GOODS_UNAVAILABLE);
         }
         if (!EconomyServices.isRegistered()) {
             return Outcome.fail(Reason.ECONOMY_UNAVAILABLE);
@@ -79,7 +97,7 @@ public final class ShopTransaction {
             }
         }
 
-        giveItems(player, spec.item(), spec.quantity());
+        giveItems(player, goods, spec.quantity());
         return new Outcome(Reason.OK, price, price);
     }
 
@@ -93,7 +111,8 @@ public final class ShopTransaction {
      * 调用方应把 settled 与 listed 一并展示给玩家, 让衰减是可见的。
      */
     public static Outcome sell(ServerPlayer player, ShopSignSpec spec) {
-        if (!spec.price().allowsSell()) {
+        // 样品店只卖不收 (解析层已拒绝样品店写 S, 这里是纵深防御)。
+        if (spec.isTemplate() || !spec.price().allowsSell()) {
             return Outcome.fail(Reason.DIRECTION_UNSUPPORTED);
         }
         if (!EconomyServices.isRegistered()) {
@@ -205,42 +224,50 @@ public final class ShopTransaction {
 
     /**
      * 按最大堆叠分批塞进背包; 放不下的掉在玩家脚下 (玩家已付款, 绝不允许货物蒸发)。
+     * 每一件都是原型的复制品, NBT 与原型完全相同 (样品店的枪型号、子弹型号、图纸内容都在 NBT 里)。
      *
      * 兜底判据用"背包实际增量"而不是 {@code Inventory.add} 的返回值 —— 这是一个会真吞货的坑:
      * 创造模式下 vanilla 在本轮一件都没塞进去时, 会把 stack 清零并 return true (判据是
      * {@code abilities.instabuild}), 于是"add 返回 true 且 stack 已空"同时成立, 依赖返回值的兜底
      * 分支永不触发, 已付款的货物就真的消失了。且不必背包全满 —— 只要没有空槽、现有堆叠又只能吸收
      * 一部分, 未被吸收的部分同样蒸发。
+     *
+     * 增量必须数整个物品栏 (含副手), 不能只数主背包 36 格: {@code Inventory.add} 找可叠加槽位时先看
+     * 当前选中格、再看副手、最后才看主背包。玩家副手拿着同种物品时, 被副手吸收的那部分不计入主背包
+     * 增量, 会被当成"没送到"在脚下再补一份 —— 每次购买最多多出 (堆叠上限 - 1) 个, 等于无限复制。
      */
-    private static void giveItems(ServerPlayer player, Item item, int count) {
-        int maxStack = new ItemStack(item).getMaxStackSize();
+    private static void giveItems(ServerPlayer player, ItemStack goods, int count) {
+        int maxStack = goods.getMaxStackSize();
         if (maxStack <= 0) {
             // 理论上不该发生; 若某 mod 物品声明了 0 堆叠, 下面的循环会永不推进, 必须炸出来而不是挂死主线程。
-            throw new IllegalStateException("item " + item + " reports maxStackSize=" + maxStack);
+            throw new IllegalStateException("item " + goods.getItem() + " reports maxStackSize=" + maxStack);
         }
         int remaining = count;
         while (remaining > 0) {
             int batch = Math.min(remaining, maxStack);
-            int before = countAnyInMainInventory(player, item);
-            player.getInventory().add(new ItemStack(item, batch));
-            int delivered = countAnyInMainInventory(player, item) - before;
+            int before = countMatchingAnywhere(player, goods);
+            player.getInventory().add(goods.copyWithCount(batch));
+            int delivered = countMatchingAnywhere(player, goods) - before;
             if (delivered < batch) {
-                player.drop(new ItemStack(item, batch - delivered), false);
+                player.drop(goods.copyWithCount(batch - delivered), false);
             }
             remaining -= batch;
         }
     }
 
     /**
-     * 数主背包里该物品的总数, 不论 NBT 与损伤。仅供 {@link #giveItems} 校验实际交付量,
-     * 与 {@link #countSellable} 的"可卖"判定是两回事 (那个要卡 NBT, 这个只关心到没到货)。
+     * 数整个物品栏 (主背包 + 盔甲 + 副手) 里与原型同物品同 NBT 的总数。仅供 {@link #giveItems} 校验实际
+     * 交付量, 与 {@link #countSellable} 的"可卖"判定是两回事 (那个只数主背包且要卡 NBT)。
+     *
+     * 判据用 isSameItemSameTags 而不是只比物品: 与 {@code Inventory.add} 的合并判据一致 ——
+     * 只有同物品同 NBT 的栈才会被合并进去, 数的口径和放的口径必须相同, 增量才准。
      */
-    private static int countAnyInMainInventory(ServerPlayer player, Item item) {
+    private static int countMatchingAnywhere(ServerPlayer player, ItemStack goods) {
         Inventory inv = player.getInventory();
         int total = 0;
-        for (int i = 0; i < mainInventorySize(inv); i++) {
+        for (int i = 0; i < inv.getContainerSize(); i++) {
             ItemStack stack = inv.getItem(i);
-            if (stack.is(item)) {
+            if (ItemStack.isSameItemSameTags(stack, goods)) {
                 total += stack.getCount();
             }
         }

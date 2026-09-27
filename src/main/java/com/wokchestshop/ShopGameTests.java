@@ -13,13 +13,16 @@ import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerLevel;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.nbt.ListTag;
 import net.minecraft.world.InteractionHand;
 import net.minecraft.world.entity.EquipmentSlot;
+import net.minecraft.world.entity.item.ItemEntity;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.entity.SignBlockEntity;
 import net.minecraft.world.level.block.entity.SignText;
+import net.minecraft.world.phys.AABB;
 import net.minecraft.world.phys.BlockHitResult;
 import net.minecraft.world.phys.Vec3;
 import net.minecraftforge.event.entity.player.PlayerInteractEvent;
@@ -588,7 +591,7 @@ public final class ShopGameTests {
     // ============================================================
 
     /**
-     * 激活闸门: 非 OP 右键不能激活, OP 右键激活并上蜡。
+     * 激活闸门: 非 OP 右键不能激活; OP 第一次右键只预览 (不登记、不上蜡), 第二次右键才激活并上蜡。
      * 这是整套权限模型唯一的入口, 之前只有纯逻辑用例覆盖登记表本身, handler 从未被实例化过。
      */
     @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
@@ -609,7 +612,12 @@ public final class ShopGameTests {
 
             op(level, player);
             handler.onRightClick(rightClick(player, pos));
-            helper.assertTrue(registry.isActivated(pos), "an op right click activates the shop");
+            helper.assertTrue(!registry.isActivated(pos),
+                    "a single op right click only previews - a tricked op must not activate anything");
+            helper.assertTrue(!sign.isWaxed(), "and the preview does not wax the sign either");
+
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "the confirming second op right click activates the shop");
             helper.assertTrue(sign.isWaxed(), "activation waxes the sign so its text is frozen");
             AdminShopRegistry.ShopRecord rec = registry.recordAt(pos);
             helper.assertTrue(rec.quantity() == 16 && rec.buyPrice() == 250L && rec.sellPrice() == 200L,
@@ -632,8 +640,7 @@ public final class ShopGameTests {
         SignBlockEntity sign = (SignBlockEntity) level.getBlockEntity(pos);
 
         try {
-            op(level, player);
-            handler.onRightClick(rightClick(player, pos));
+            activateAsOp(level, handler, player, pos);
             helper.assertTrue(registry.isActivated(pos), "shop is live before tampering");
 
             // 撬蜡改价 (把 250 改成 free)。
@@ -667,8 +674,7 @@ public final class ShopGameTests {
         AdminShopRegistry registry = AdminShopRegistry.get(level);
 
         try {
-            op(level, player);
-            handler.onRightClick(rightClick(player, pos));
+            activateAsOp(level, handler, player, pos);
             helper.assertTrue(registry.isActivated(pos), "shop is live");
 
             // 非玩家途径移除告示牌: 不经 BlockEvent.BreakEvent, 所以登记不会被注销。
@@ -704,8 +710,7 @@ public final class ShopGameTests {
         AdminShopRegistry registry = AdminShopRegistry.get(level);
 
         try {
-            op(level, player);
-            handler.onRightClick(rightClick(player, pos));
+            activateAsOp(level, handler, player, pos);
             helper.assertTrue(registry.isActivated(pos), "shop is live");
 
             deop(level, player);
@@ -748,8 +753,7 @@ public final class ShopGameTests {
         AdminShopRegistry registry = AdminShopRegistry.get(level);
 
         try {
-            op(level, player);
-            handler.onRightClick(rightClick(player, pos));
+            activateAsOp(level, handler, player, pos);
             helper.assertTrue(registry.isActivated(pos), "shop is live");
 
             eco.grant(player, Currency.CREDIT, 1000L);
@@ -765,6 +769,322 @@ public final class ShopGameTests {
                     "five rapid right clicks must charge exactly one purchase, not five (actual spent=" + spent + ")");
             helper.assertTrue(countInInventory(player, Items.DIAMOND) == 1,
                     "and deliver exactly one unit");
+        } finally {
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    // ============================================================
+    // 样品商店 (带 NBT 的商品: TaCZ 枪/弹、枪匠图纸) 与交付防复制
+    // ============================================================
+
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void signSpecParsesTemplateLine(GameTestHelper helper) {
+        ShopSignSpec spec = specOf("Admin Shop", "1", "B 3000", "@AK47");
+        helper.assertTrue(spec.isTemplate(), "'@AK47' on line 4 makes a sample shop");
+        helper.assertTrue("AK47".equals(spec.templateLabel()), "the label is the text after @");
+        helper.assertTrue(spec.item() == null, "a sample shop has no item id - the goods live in the snapshot");
+
+        // 空白与全角写法: 中文输入法下打出来的 "＠ 7.62　步枪弹" 必须规范成同一个显示名, 否则快照比对会误判篡改。
+        ShopSignSpec ime = specOf("管理员商店", "30", "B 450", "＠ 7.62　步枪弹 ");
+        helper.assertTrue(ime.isTemplate() && "7.62 步枪弹".equals(ime.templateLabel()),
+                "full-width @ and spaces normalize (actual label=" + ime.templateLabel() + ")");
+
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 100", "@"}).error()
+                == ShopSignSpec.Error.BAD_ITEM, "a bare '@' with no label is rejected");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 100", "@1234567890123456"}).error()
+                == ShopSignSpec.Error.BAD_ITEM, "a label longer than 15 characters is rejected");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 100", "@123456789012345"}).ok(),
+                "exactly 15 characters is accepted");
+
+        // 样品店只卖不收: 写了 S 的一律拒绝, 不管是双向还是单收。
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B 100:50 S", "@AK47"}).error()
+                == ShopSignSpec.Error.TEMPLATE_SELL_UNSUPPORTED, "a sample shop with a buyback price is rejected");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "S 50", "@AK47"}).error()
+                == ShopSignSpec.Error.TEMPLATE_SELL_UNSUPPORTED, "a sell-only sample shop is rejected");
+        helper.assertTrue(ShopSignSpec.parse(new String[]{"Admin Shop", "1", "B free", "@AK47"}).ok(),
+                "a free sample shop (giveaway) is allowed");
+
+        helper.succeed();
+    }
+
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void registryTemplateSnapshotRoundTripAndMatch(GameTestHelper helper) {
+        AdminShopRegistry registry = new AdminShopRegistry();
+        BlockPos pos = new BlockPos(5, 64, 5);
+        ShopSignSpec spec = specOf("Admin Shop", "1", "B 3000", "@AK47");
+        ItemStack sample = taggedSample(Items.DIAMOND_SWORD, "ak47");
+        sample.setCount(1);
+        ItemStack heldStack = sample.copyWithCount(1);
+
+        registry.activate(pos, spec, heldStack);
+        heldStack.getOrCreateTag().putString("wokchestshop_test_model", "mutated-after-activation");
+        AdminShopRegistry.ShopRecord record = registry.recordAt(pos);
+        helper.assertTrue(record.isTemplate(), "the snapshot carries the sample");
+        helper.assertTrue(ItemStack.isSameItemSameTags(record.goods(), sample),
+                "the stored sample is a copy: mutating the op's held stack afterwards must not change what is sold");
+
+        // 数量归一: OP 手里拿一组 5 个, 样品只记 1 个, 每次卖几个由第 2 行决定。
+        ItemStack fiveDiamonds = taggedSample(Items.DIAMOND, "9x19");
+        fiveDiamonds.setCount(5);
+        BlockPos stackPos = new BlockPos(6, 64, 5);
+        registry.activate(stackPos, specOf("Admin Shop", "64", "B 500", "@9mm"), fiveDiamonds);
+        helper.assertTrue(registry.recordAt(stackPos).goods().getCount() == 1, "the stored sample is normalized to count 1");
+
+        AdminShopRegistry reloaded = AdminShopRegistry.load(registry.save(new CompoundTag()));
+        AdminShopRegistry.ShopRecord back = reloaded.recordAt(pos);
+        helper.assertTrue(back != null && back.isTemplate(), "a sample shop survives save/load as a sample shop");
+        helper.assertTrue(ItemStack.isSameItemSameTags(back.goods(), sample), "the sample NBT survives save/load");
+        helper.assertTrue("AK47".equals(back.templateLabel()), "the label survives save/load");
+        helper.assertTrue(back.matches(spec), "the reloaded snapshot still matches the sign");
+
+        // 逐项比对: 改显示名、把牌改成物品 id 店、改价都要被抓到。
+        helper.assertTrue(!back.matches(specOf("Admin Shop", "1", "B 3000", "@M4A1")), "label change breaks the match");
+        helper.assertTrue(!back.matches(specOf("Admin Shop", "1", "B 3000", "diamond_sword")),
+                "a sample shop rewritten as an item-id shop does not match");
+        helper.assertTrue(!back.matches(specOf("Admin Shop", "1", "B free", "@AK47")), "price change breaks the match");
+
+        // 反方向: 物品 id 店的牌被改成 @显示名, 也不能对上 (快照里没有样品, 不能凭空变出商品)。
+        BlockPos idPos = new BlockPos(7, 64, 5);
+        registry.activate(idPos, specOf("Admin Shop", "1", "B 3000", "diamond_sword"));
+        helper.assertTrue(!registry.recordAt(idPos).matches(spec),
+                "an item-id shop rewritten as '@AK47' does not match");
+
+        // 旧版本存档: 没有 label/template 键, 必须读成物品 id 店且照常比对。
+        CompoundTag legacyEntry = new CompoundTag();
+        legacyEntry.putLong("pos", new BlockPos(1, 2, 3).asLong());
+        legacyEntry.putInt("quantity", 64);
+        legacyEntry.putString("item", "minecraft:diamond");
+        legacyEntry.putLong("buy", 250L);
+        legacyEntry.putLong("sell", 200L);
+        ListTag legacyList = new ListTag();
+        legacyList.add(legacyEntry);
+        CompoundTag legacy = new CompoundTag();
+        legacy.put("shops", legacyList);
+        AdminShopRegistry.ShopRecord legacyRecord = AdminShopRegistry.load(legacy).recordAt(new BlockPos(1, 2, 3));
+        helper.assertTrue(legacyRecord != null && !legacyRecord.isTemplate(),
+                "a pre-upgrade entry loads as an item-id shop");
+        helper.assertTrue(legacyRecord.matches(specOf("Admin Shop", "64", "B 250:200 S", "diamond")),
+                "and still matches its original sign after the upgrade");
+
+        helper.succeed();
+    }
+
+    /** 样品店交付的是样品的复制品: 不可堆叠的逐件交付, 可堆叠的按堆叠上限分组, NBT 一个不差。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void buyFromTemplateDeliversExactCopies(GameTestHelper helper) {
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        eco.grant(player, Currency.CREDIT, 10_000L);
+
+        ItemStack gun = taggedSample(Items.DIAMOND_SWORD, "ak47");
+        ShopTransaction.Outcome guns = ShopTransaction.buy(player, specOf("Admin Shop", "3", "B 3000", "@AK47"), gun);
+        helper.assertTrue(guns.ok() && guns.settled() == 3000L, "one purchase charges the listed price once");
+        helper.assertTrue(countMatching(player, gun) == 3, "three separate copies of the tagged sample are delivered");
+        helper.assertTrue(countInInventory(player, Items.DIAMOND_SWORD) == 3,
+                "and nothing else of that item (no untagged blanks)");
+
+        ItemStack ammo = taggedSample(Items.DIAMOND, "762x39");
+        ShopTransaction.Outcome rounds = ShopTransaction.buy(player, specOf("Admin Shop", "100", "B 500", "@762"), ammo);
+        helper.assertTrue(rounds.ok(), "a stackable sample shop sells");
+        helper.assertTrue(countMatching(player, ammo) == 100,
+                "100 tagged copies arrive, split across stacks (actual=" + countMatching(player, ammo) + ")");
+        helper.assertTrue(eco.creditBalance(player) == 10_000L - 3000L - 500L, "exactly two charges were made");
+
+        helper.succeed();
+    }
+
+    /**
+     * X006 回归: 副手拿着同种物品时, Inventory.add 会先把一部分塞进副手。旧实现只数主背包 36 格的增量,
+     * 把副手吸收的那部分当成"没送到"在脚下再补一份 —— 每次购买最多多出 (堆叠上限 - 1) 个。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void buyDoesNotDuplicateWhenOffhandAbsorbs(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        eco.grant(player, Currency.CREDIT, 1000L);
+        player.setItemSlot(EquipmentSlot.OFFHAND, new ItemStack(Items.DIAMOND, 60));
+
+        try {
+            ShopTransaction.Outcome outcome = ShopTransaction.buy(player, specOf("Admin Shop", "16", "B 250", "diamond"));
+            helper.assertTrue(outcome.ok(), "the purchase succeeds");
+            helper.assertTrue(player.getInventory().offhand.get(0).getCount() == 64,
+                    "the offhand stack absorbed 4 (the scenario that used to duplicate)");
+            helper.assertTrue(countInInventory(player, Items.DIAMOND) == 60 + 16,
+                    "exactly 16 were delivered in total (actual total=" + countInInventory(player, Items.DIAMOND) + ")");
+            helper.assertTrue(droppedNear(level, player).isEmpty(),
+                    "nothing was dropped at the player's feet - a drop here means goods were paid for once and delivered twice");
+        } finally {
+            droppedNear(level, player).forEach(ItemEntity::discard);
+        }
+        helper.succeed();
+    }
+
+    /** 样品所属 mod 被移除后商品读出来是空栈: 必须拒绝交易且不扣钱, 不能"扣了钱零交付"。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void buyRefusesUnavailableGoodsWithoutCharging(GameTestHelper helper) {
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        eco.grant(player, Currency.CREDIT, 1000L);
+
+        ShopTransaction.Outcome outcome = ShopTransaction.buy(
+                player, specOf("Admin Shop", "1", "B 250", "@AK47"), ItemStack.EMPTY);
+        helper.assertTrue(outcome.reason() == ShopTransaction.Reason.GOODS_UNAVAILABLE,
+                "empty goods are refused with GOODS_UNAVAILABLE");
+        helper.assertTrue(eco.creditBalance(player) == 1000L, "and the player is not charged");
+
+        // 读快照时样品物品已不在注册表 (模拟 mod 被移除): goods() 返回空栈。
+        CompoundTag entry = new CompoundTag();
+        entry.putLong("pos", new BlockPos(9, 9, 9).asLong());
+        entry.putInt("quantity", 1);
+        entry.putString("item", "tacz:modern_kinetic_gun");
+        entry.putString("label", "AK47");
+        entry.putLong("buy", 250L);
+        entry.putLong("sell", AdminShopRegistry.ABSENT_PRICE);
+        CompoundTag orphan = new CompoundTag();
+        orphan.putString("id", "nonexistentmod:gun");
+        orphan.putByte("Count", (byte) 1);
+        entry.put("template", orphan);
+        ListTag list = new ListTag();
+        list.add(entry);
+        CompoundTag root = new CompoundTag();
+        root.put("shops", list);
+        AdminShopRegistry.ShopRecord record = AdminShopRegistry.load(root).recordAt(new BlockPos(9, 9, 9));
+        helper.assertTrue(record.isTemplate() && record.goods().isEmpty(),
+                "a sample whose item is no longer registered reads back as empty goods");
+
+        helper.succeed();
+    }
+
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void sellIsRefusedOnTemplateShop(GameTestHelper helper) {
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        player.getInventory().add(new ItemStack(Items.DIAMOND_SWORD));
+        long before = eco.creditBalance(player);
+
+        // 解析层已经不允许样品店写 S; 这里直接构造规格, 验证交易层的纵深防御。
+        ShopSignSpec forged = new ShopSignSpec(1, null, "AK47", ShopPriceLine.parse("B 100:50 S"));
+        helper.assertTrue(ShopTransaction.sell(player, forged).reason() == ShopTransaction.Reason.DIRECTION_UNSUPPORTED,
+                "a sample shop never buys back, even if a forged spec claims it does");
+        helper.assertTrue(eco.creditBalance(player) == before, "nothing paid");
+        helper.assertTrue(countInInventory(player, Items.DIAMOND_SWORD) == 1, "nothing taken");
+
+        helper.succeed();
+    }
+
+    /** 两步激活: 预览后牌面被改, 下一次右键只能是新的预览, 不能激活改过的内容。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerConfirmationRequiresUnchangedContent(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "16", "B 250", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+        SignBlockEntity sign = (SignBlockEntity) level.getBlockEntity(pos);
+
+        try {
+            op(level, player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(!registry.isActivated(pos), "first click previews only");
+
+            // 预览之后、确认之前牌被改成白送 (例如骗 OP 看完正常条款再偷偷换牌)。
+            writeSign(sign, "Admin Shop", "16", "B free", "diamond");
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(!registry.isActivated(pos),
+                    "a click after the content changed is a fresh preview, not a confirmation");
+
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(registry.isActivated(pos), "confirming the now-shown content activates it");
+            helper.assertTrue(registry.recordAt(pos).buyPrice() == 0L,
+                    "and what got activated is exactly what the op was last shown");
+        } finally {
+            cleanup(level, player, registry, pos);
+        }
+        helper.succeed();
+    }
+
+    /** 两步激活的确认窗口会过期: 预览后隔太久再右键, 只能算新的预览。 */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH, timeoutTicks = 400)
+    public static void handlerConfirmationExpires(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "16", "B 250", "diamond");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+
+        op(level, player);
+        handler.onRightClick(rightClick(player, pos));
+        helper.runAfterDelay(ShopConstants.ACTIVATION_CONFIRM_TICKS + 20, () -> {
+            try {
+                handler.onRightClick(rightClick(player, pos));
+                helper.assertTrue(!registry.isActivated(pos),
+                        "a confirmation after the window has expired must not activate");
+                handler.onRightClick(rightClick(player, pos));
+                helper.assertTrue(registry.isActivated(pos), "a fresh preview plus a prompt confirmation does");
+            } finally {
+                cleanup(level, player, registry, pos);
+            }
+            helper.succeed();
+        });
+    }
+
+    /**
+     * 样品店端到端: 空手不能激活; 预览与确认之间换了样品只能重新预览; 激活后买到的是样品的复制品;
+     * 样品店左键不收购。
+     */
+    @GameTest(templateNamespace = TEMPLATE_NS, template = EMPTY, batch = BATCH)
+    public static void handlerTemplateShopCapturesSampleAndSellsCopies(GameTestHelper helper) {
+        ServerLevel level = helper.getLevel();
+        IEconomyService eco = requireEconomy(helper);
+        ServerPlayer player = MockGameTestPlayers.makeMockServerPlayerWithChannel(helper);
+        BlockPos pos = placeShopSign(helper, player, "Admin Shop", "1", "B 3000", "@AK47");
+
+        ShopInteractionHandler handler = new ShopInteractionHandler();
+        AdminShopRegistry registry = AdminShopRegistry.get(level);
+        ItemStack ak = taggedSample(Items.DIAMOND_SWORD, "ak47");
+        ItemStack m4 = taggedSample(Items.DIAMOND_SWORD, "m4a1");
+
+        try {
+            player.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+            activateAsOp(level, handler, player, pos);
+            helper.assertTrue(!registry.isActivated(pos), "a sample shop cannot be activated empty-handed");
+
+            player.setItemInHand(InteractionHand.MAIN_HAND, ak.copy());
+            handler.onRightClick(rightClick(player, pos));
+            player.setItemInHand(InteractionHand.MAIN_HAND, m4.copy());
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(!registry.isActivated(pos),
+                    "swapping the sample between preview and confirmation is a fresh preview, not a confirmation");
+
+            player.setItemInHand(InteractionHand.MAIN_HAND, ak.copy());
+            activateAsOp(level, handler, player, pos);
+            helper.assertTrue(registry.isActivated(pos), "holding the same sample for both clicks activates");
+            helper.assertTrue(ItemStack.isSameItemSameTags(registry.recordAt(pos).goods(), ak),
+                    "the snapshot holds the ak sample, not the m4 shown earlier");
+
+            // 普通玩家来买。
+            deop(level, player);
+            player.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+            eco.grant(player, Currency.CREDIT, 5000L);
+            long before = eco.creditBalance(player);
+            handler.onRightClick(rightClick(player, pos));
+            helper.assertTrue(before - eco.creditBalance(player) == 3000L, "the listed price is charged");
+            helper.assertTrue(countMatching(player, ak) == 1, "the buyer receives a copy of the exact sample");
+            helper.assertTrue(countMatching(player, m4) == 0, "not the other gun");
+
+            // 左键卖回: 样品店不收购, 枪留在背包里, 不发钱。换一个 handler 实例, 避开同坐标的成交防抖
+            // (防抖表按实例持有), 否则这里的断言会因为"被防抖吞掉"而假绿。
+            long afterBuy = eco.creditBalance(player);
+            PlayerInteractEvent.LeftClickBlock sellClick = leftClick(player, pos);
+            new ShopInteractionHandler().onLeftClick(sellClick);
+            helper.assertTrue(sellClick.isCanceled(), "left-clicking an active sample shop does not break it");
+            helper.assertTrue(eco.creditBalance(player) == afterBuy, "a sample shop pays nothing on left click");
+            helper.assertTrue(countMatching(player, ak) == 1, "and takes nothing back");
         } finally {
             cleanup(level, player, registry, pos);
         }
@@ -806,6 +1126,37 @@ public final class ShopGameTests {
 
     private static void op(ServerLevel level, ServerPlayer player) {
         level.getServer().getPlayerList().op(player.getGameProfile());
+    }
+
+    /** OP 激活一块牌: 两步 (预览 + 确认)。样品店调用前要先把样品放进主手。 */
+    private static void activateAsOp(ServerLevel level, ShopInteractionHandler handler, ServerPlayer player,
+                                     BlockPos pos) {
+        op(level, player);
+        handler.onRightClick(rightClick(player, pos));
+        handler.onRightClick(rightClick(player, pos));
+    }
+
+    /** 玩家附近的掉落物 (交付时背包放不下才会掉; 本不该有掉落的场景出现掉落 = 多发了货)。 */
+    private static java.util.List<ItemEntity> droppedNear(ServerLevel level, ServerPlayer player) {
+        return level.getEntitiesOfClass(ItemEntity.class, new AABB(player.blockPosition()).inflate(4.0D));
+    }
+
+    /** 带自定义标签的测试样品: 模拟 TaCZ 枪/弹那种"物品 id 相同、型号在 NBT 里"的商品。 */
+    private static ItemStack taggedSample(net.minecraft.world.item.Item item, String model) {
+        ItemStack stack = new ItemStack(item);
+        stack.getOrCreateTag().putString("wokchestshop_test_model", model);
+        return stack;
+    }
+
+    private static int countMatching(ServerPlayer player, ItemStack prototype) {
+        int total = 0;
+        for (int i = 0; i < player.getInventory().getContainerSize(); i++) {
+            ItemStack stack = player.getInventory().getItem(i);
+            if (ItemStack.isSameItemSameTags(stack, prototype)) {
+                total += stack.getCount();
+            }
+        }
+        return total;
     }
 
     private static void deop(ServerLevel level, ServerPlayer player) {

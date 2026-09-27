@@ -15,11 +15,23 @@ import java.util.Locale;
  * 这样告示牌格式的全部边界 (数量越界 / 物品不存在 / 价格语法) 都能在毫秒级 GameTest 里穷举,
  * 而不必真去世界里摆一块牌。
  *
- * @param quantity 每次交易的物品个数 (1..{@link ShopConstants#MAX_QUANTITY})
- * @param item     交易标的
- * @param price    买卖价 (见 {@link ShopPriceLine})
+ * 第 4 行两种写法:
+ *  - 物品 id (如 {@code diamond}): 商品是该物品不带 NBT 的素材, {@code item} 非 null、{@code templateLabel} 为 null。
+ *  - {@code @显示名} (如 {@code @AK47}): 样品商店, 商品是 OP 激活时主手那件样品 (连同 NBT), 样品本身存在
+ *    {@link AdminShopRegistry} 的激活快照里, 牌面只有显示名; 此时 {@code item} 为 null。样品店只卖不收:
+ *    同一型号的枪可能磨损、加装配件、带枪匠品质, 按同一价格收回会把状态差直接铸成信用点。
+ *
+ * @param quantity      每次交易的物品个数 (1..{@link ShopConstants#MAX_QUANTITY})
+ * @param item          交易标的 (样品店为 null)
+ * @param templateLabel 样品店显示名 (物品 id 店为 null)
+ * @param price         买卖价 (见 {@link ShopPriceLine})
  */
-public record ShopSignSpec(int quantity, Item item, ShopPriceLine price) {
+public record ShopSignSpec(int quantity, Item item, String templateLabel, ShopPriceLine price) {
+
+    /** 是否样品商店 (第 4 行以 {@link ShopConstants#TEMPLATE_PREFIX} 开头)。 */
+    public boolean isTemplate() {
+        return templateLabel != null;
+    }
 
     /** 解析失败的原因; 每个值对应一条给玩家看的 lang 提示。 */
     public enum Error {
@@ -29,7 +41,9 @@ public record ShopSignSpec(int quantity, Item item, ShopPriceLine price) {
         BAD_ITEM,
         BAD_PRICE,
         /** 卖价高于买价: 玩家可低买高卖套利, 系统侧无限库存无限资金, 不存在任何合法用例。 */
-        INVERTED_SPREAD
+        INVERTED_SPREAD,
+        /** 样品商店写了收购价 S。样品店只卖不收, 理由见类注释。 */
+        TEMPLATE_SELL_UNSUPPORTED
     }
 
     /** 解析结果: spec 与 error 恒有且仅有一个非 null。 */
@@ -106,9 +120,19 @@ public record ShopSignSpec(int quantity, Item item, ShopPriceLine price) {
             return Result.fail(Error.BAD_QUANTITY);
         }
 
-        Item item = parseItem(lines[ShopConstants.LINE_ITEM]);
-        if (item == null) {
-            return Result.fail(Error.BAD_ITEM);
+        String itemLine = lines[ShopConstants.LINE_ITEM];
+        String templateLabel = null;
+        Item item = null;
+        if (isTemplateLine(itemLine)) {
+            templateLabel = parseTemplateLabel(itemLine);
+            if (templateLabel == null) {
+                return Result.fail(Error.BAD_ITEM);
+            }
+        } else {
+            item = parseItem(itemLine);
+            if (item == null) {
+                return Result.fail(Error.BAD_ITEM);
+            }
         }
 
         ShopPriceLine price = ShopPriceLine.parse(lines[ShopConstants.LINE_PRICE]);
@@ -123,7 +147,34 @@ public record ShopSignSpec(int quantity, Item item, ShopPriceLine price) {
             return Result.fail(Error.INVERTED_SPREAD);
         }
 
-        return Result.of(new ShopSignSpec(quantity, item, price));
+        if (templateLabel != null && price.allowsSell()) {
+            return Result.fail(Error.TEMPLATE_SELL_UNSUPPORTED);
+        }
+
+        return Result.of(new ShopSignSpec(quantity, item, templateLabel, price));
+    }
+
+    /** 第 4 行是否样品店写法。全角 @ 同样认: 中文输入法下很容易打出来, 认不出会被当成物品 id 报"物品不存在"。 */
+    private static boolean isTemplateLine(String raw) {
+        if (raw == null) {
+            return false;
+        }
+        String s = normalizeWhitespace(raw);
+        return !s.isEmpty() && (s.charAt(0) == ShopConstants.TEMPLATE_PREFIX || s.charAt(0) == '＠');
+    }
+
+    /**
+     * 取样品店显示名: 去掉前缀后做同样的空白规范化。空名或超长返回 null。
+     *
+     * 显示名参与内容快照比对, 所以规范化必须与比对两侧一致 —— 解析和比对都走这里, 不会出现
+     * "牌上多了一个全角空格就被判成被篡改"。
+     */
+    private static String parseTemplateLabel(String raw) {
+        String label = normalizeWhitespace(normalizeWhitespace(raw).substring(1));
+        if (label.isEmpty() || label.codePointCount(0, label.length()) > ShopConstants.MAX_TEMPLATE_LABEL_LENGTH) {
+            return null;
+        }
+        return label;
     }
 
     /** 返回 <=0 表示非法 (含空行、非数字、越界); 调用方据此出 BAD_QUANTITY。 */
