@@ -62,6 +62,15 @@ repositories {
     flatDir {
         dir 'libs'
     }
+    // 主 mod 自 1.0.3x 起把 GeckoLib 声明为 mandatory (厨师工位、六档军火台的方块实体骨骼渲染),
+    // dev 运行期不带它 miningdim 在加载阶段就拒绝启动, 本 mod 的 GameTest 一个都跑不起来。
+    maven {
+        name = 'GeckoLib'
+        url = 'https://dl.cloudsmith.io/public/geckolib3/geckolib/maven/'
+        content {
+            includeGroupByRegex('software\\.bernie.*')
+        }
+    }
 }
 
 dependencies {
@@ -90,6 +99,9 @@ dependencies {
     //   classpath 由 minecraft/forge 配置集生成、不含 jarJar 内嵌件, 故 dev 侧必须走 minecraftLibrary
     //   (与主 mod build.gradle 里同名声明同理同版本, 升级时两边必须同步)。
     minecraftLibrary 'org.xerial:sqlite-jdbc:3.45.3.0'
+
+    // 主 mod 的 mandatory 依赖, 同上理由只进 dev 运行期; 版本与主 mod gradle.properties 的 geckolib_version 对齐。
+    runtimeOnly fg.deobf("software.bernie.geckolib:geckolib-forge-${mc_version}:${geckolib_version}")
 }
 
 tasks.named('jar', Jar).configure {
