@@ -1,5 +1,6 @@
 {
   "message.wokchestshop.activated": "Admin shop activated: %s x %s, %s (sign waxed; unwax it to change prices)",
+  "message.wokchestshop.confirm_activation": "About to activate admin shop: %s x %s, %s. Right-click again within %s seconds to confirm (sample shops: keep holding the same sample).",
   "message.wokchestshop.bought": "Bought %s x %s for %s credit.",
   "message.wokchestshop.sold": "Sold %s x %s for %s credit.",
   "message.wokchestshop.sold_decayed": "Sold %s x %s for %s credit (listed %s; today's income has decayed).",
@@ -9,13 +10,16 @@
   "message.wokchestshop.ok": "Transaction complete.",
   "message.wokchestshop.err.not_admin_shop": "This is not an admin shop sign.",
   "message.wokchestshop.err.bad_quantity": "Line 2 quantity invalid: digits only, 1 to 2304.",
-  "message.wokchestshop.err.bad_item": "Line 4 item id does not exist, e.g. diamond or minecraft:diamond.",
+  "message.wokchestshop.err.bad_item": "Line 4 item id does not exist, e.g. diamond or minecraft:diamond; for a sample shop write @label (1 to 15 characters).",
   "message.wokchestshop.err.bad_price": "Line 3 price invalid, e.g. B 250:200 S, B 250, S 200 or B free.",
   "message.wokchestshop.err.inverted_spread": "Sell price must not exceed buy price (that would be free arbitrage). Check whether B and S are swapped.",
+  "message.wokchestshop.err.template_sell": "A sample shop (line 4 starting with @) can only sell; it cannot have a buyback price S.",
+  "message.wokchestshop.err.template_missing": "Line 4 starting with @ makes this a sample shop; hold the sample to sell in your main hand when activating.",
   "message.wokchestshop.err.tampered": "This sign's content differs from when it was activated; the shop has been deactivated. Ask an admin to re-activate it.",
   "message.wokchestshop.err.protected": "This is an active admin shop; only admins can remove it.",
   "message.wokchestshop.err.direction": "This shop does not trade in that direction.",
   "message.wokchestshop.err.funds": "Not enough credit.",
   "message.wokchestshop.err.items": "Not enough of that item (enchanted, damaged or NBT-tagged items cannot be sold).",
-  "message.wokchestshop.err.economy": "Economy is not ready yet, try again shortly."
+  "message.wokchestshop.err.economy": "Economy is not ready yet, try again shortly.",
+  "message.wokchestshop.err.goods_unavailable": "This shop's goods are no longer available (the sample's mod may have been removed). You were not charged; please contact an admin."
 }
